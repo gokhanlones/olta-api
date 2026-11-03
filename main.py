@@ -108,21 +108,46 @@ async def marine(lat: float, lng: float):
 
 @app.get("/debug")
 async def debug():
+    result = {}
+
+    # Modülde hangi fonksiyonlar var
+    result["module_funcs"] = [f for f in dir(copernicusmarine) if not f.startswith("_")]
+
+    # read_dataframe dene
     loop = asyncio.get_event_loop()
+    try:
+        df = await loop.run_in_executor(
+            executor,
+            lambda: copernicusmarine.read_dataframe(
+                dataset_id=PHY_DATASET,
+                variables=["thetao"],
+                minimum_latitude=40.9,
+                maximum_latitude=41.1,
+                minimum_longitude=28.9,
+                maximum_longitude=29.1,
+            )
+        )
+        result["read_dataframe_type"] = str(type(df))
+        if df is not None and not df.empty:
+            result["thetao"] = float(df["thetao"].dropna().iloc[-1])
+    except Exception as e:
+        result["read_dataframe_error"] = str(e)[:300]
+
+    # open_dataset arco-geo-series service ile dene
     try:
         ds = await loop.run_in_executor(
             executor,
             lambda: copernicusmarine.open_dataset(
                 dataset_id=PHY_DATASET,
+                service="arco-geo-series",
             )
         )
-        return {
-            "type": str(type(ds)),
-            "is_none": ds is None,
-            "vars": list(ds.data_vars)[:10] if ds is not None else [],
-        }
+        result["arco_type"] = str(type(ds))
+        result["arco_is_none"] = ds is None
     except Exception as e:
-        return {"error": str(e)[:300]}
+        result["arco_error"] = str(e)[:300]
+
+    return result
 
 
 @app.get("/foodchain")
