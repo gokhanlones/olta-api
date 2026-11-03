@@ -53,6 +53,10 @@ def get_cmems_value(dataset_id, variable, lat, lng):
             minimum_longitude=lng - 0.15,
             maximum_longitude=lng + 0.15,
         )
+        if ds is None:
+            return f"ERR: ds is None for {dataset_id}"
+        if variable not in ds:
+            return f"ERR: {variable} not in ds, keys={list(ds.keys())[:5]}"
         arr = ds[variable].isel(time=-1)
         if "depth" in arr.dims:
             arr = arr.isel(depth=0)
@@ -62,7 +66,7 @@ def get_cmems_value(dataset_id, variable, lat, lng):
         return round(val, 3)
     except Exception as e:
         print(f"CMEMS error {dataset_id}/{variable}: {e}")
-        return str(e)[:100]  # Hata mesajını döndür
+        return f"ERR: {str(e)[:120]}"
 
 
 def get_fishbase_food(spec_code):
