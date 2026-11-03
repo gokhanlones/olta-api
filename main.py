@@ -124,6 +124,21 @@ def foodchain(spec_code: int):
     return {"prey": get_fishbase_food(spec_code)}
 
 
+@app.get("/debug")
+def debug():
+    try:
+        cat = copernicusmarine.describe(
+            contains=["GLOBAL_ANALYSISFORECAST_PHY_001_024"],
+            include_all_versions=False,
+        )
+        result = []
+        for p in cat.products[:2]:
+            datasets = [d.dataset_id for d in p.datasets[:15]]
+            result.append({"product": p.product_id, "datasets": datasets})
+        return result
+    except Exception as e:
+        return {"error": str(e)[:300]}
+
 @app.get("/health")
 def health():
     return {
