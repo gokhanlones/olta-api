@@ -14,7 +14,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Copernicusmarine 2.x doğru env var isimleri
 CMEMS_USER = os.environ.get("CMEMS_USERNAME")
 CMEMS_PASS = os.environ.get("CMEMS_PASSWORD")
 
@@ -22,6 +21,26 @@ if CMEMS_USER:
     os.environ["COPERNICUSMARINE_SERVICE_USERNAME"] = CMEMS_USER
 if CMEMS_PASS:
     os.environ["COPERNICUSMARINE_SERVICE_PASSWORD"] = CMEMS_PASS
+
+# Her değişken için doğru dataset ID
+PHYSICS_DATASETS = {
+    "thetao": "cmems_mod_glo_phy-thetao_anfc_0.083deg_PT6H-i",
+    "so":     "cmems_mod_glo_phy-so_anfc_0.083deg_PT6H-i",
+    "uo":     "cmems_mod_glo_phy-cur_anfc_0.083deg_PT6H-i",
+    "vo":     "cmems_mod_glo_phy-cur_anfc_0.083deg_PT6H-i",
+    "zos":    "cmems_mod_glo_phy-ssh_anfc_0.083deg_PT6H-i",
+    "mlotst": "cmems_mod_glo_phy-mnhcl_anfc_0.083deg_PT6H-i",
+}
+
+BGC_DATASETS = {
+    "chl":  "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m",
+    "phyc": "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m",
+    "o2":   "cmems_mod_glo_bgc-bio_anfc_0.25deg_P1D-m",
+    "no3":  "cmems_mod_glo_bgc-nut_anfc_0.25deg_P1D-m",
+    "po4":  "cmems_mod_glo_bgc-nut_anfc_0.25deg_P1D-m",
+    "ph":   "cmems_mod_glo_bgc-car_anfc_0.25deg_P1D-m",
+    "nppv": "cmems_mod_glo_bgc-pp_anfc_0.25deg_P1D-m",
+}
 
 
 def get_cmems_value(dataset_id, variable, lat, lng):
@@ -43,7 +62,7 @@ def get_cmems_value(dataset_id, variable, lat, lng):
         return round(val, 3)
     except Exception as e:
         print(f"CMEMS error {dataset_id}/{variable}: {e}")
-        return None
+        return str(e)[:100]  # Hata mesajını döndür
 
 
 def get_fishbase_food(spec_code):
@@ -62,14 +81,8 @@ def get_fishbase_food(spec_code):
 
 @app.get("/marine")
 def marine(lat: float, lng: float):
-    result = {
-        "lat": lat,
-        "lng": lng,
-        "physics": {},
-        "biochemistry": {},
-    }
+    result = {"lat": lat, "lng": lng, "physics": {}, "biochemistry": {}}
 
-    phys_dataset = "cmems_mod_glo_phy-all_anfc_0.083deg_PT6H-i"
     physics_vars = {
         "thetao": "sst",
         "so":     "salinity",
@@ -79,15 +92,14 @@ def marine(lat: float, lng: float):
         "mlotst": "mixed_layer_depth",
     }
     for var, key in physics_vars.items():
-        result["physics"][key] = get_cmems_value(phys_dataset, var, lat, lng)
+        result["physics"][key] = get_cmems_value(PHYSICS_DATASETS[var], var, lat, lng)
 
     uo = result["physics"].get("current_east")
     vo = result["physics"].get("current_north")
-    if uo is not None and vo is not None:
+    if isinstance(uo, float) and isinstance(vo, float):
         result["physics"]["current_speed"]     = round(math.sqrt(uo**2 + vo**2), 3)
         result["physics"]["current_direction"] = round((math.degrees(math.atan2(uo, vo)) + 360) % 360, 1)
 
-    bgc_dataset = "cmems_mod_glo_bgc-all_anfc_0.25deg_P1D-m"
     bgc_vars = {
         "chl":  "chlorophyll",
         "phyc": "phytoplankton",
@@ -98,7 +110,7 @@ def marine(lat: float, lng: float):
         "nppv": "primary_production",
     }
     for var, key in bgc_vars.items():
-        result["biochemistry"][key] = get_cmems_value(bgc_dataset, var, lat, lng)
+        result["biochemistry"][key] = get_cmems_value(BGC_DATASETS[var], var, lat, lng)
 
     return result
 
