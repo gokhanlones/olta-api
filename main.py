@@ -1,9 +1,10 @@
 import os
 import math
-import requests
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 import copernicusmarine
+import xarray as xr
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
@@ -17,57 +18,102 @@ app.add_middleware(
 CMEMS_USER = os.environ.get("CMEMS_USERNAME")
 CMEMS_PASS = os.environ.get("CMEMS_PASSWORD")
 
-if CMEMS_USER:
-    os.environ["COPERNICUSMARINE_SERVICE_USERNAME"] = CMEMS_USER
-if CMEMS_PASS:
-    os.environ["COPERNICUSMARINE_SERVICE_PASSWORD"] = CMEMS_PASS
-
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "user": bool(CMEMS_USER)}
+    return {
+        "status": "ok",
+        "user": bool(CMEMS_USER),
+    }
 
 
 @app.get("/debug")
 def debug():
-    result = {}
-
-    # Login
     try:
-        r = copernicusmarine.login(
+        ds = copernicusmarine.open_dataset(
+            dataset_id="cmems_mod_glo_phy_anfc_0.083deg_P1D-m",
             username=CMEMS_USER,
             password=CMEMS_PASS,
-            overwrite_configuration_file=True,
+            minimum_latitude=40.9,
+            maximum_latitude=41.1,
+            minimum_longitude=28.9,
+            maximum_longitude=29.1,
         )
-        result["login"] = str(r)
-    except Exception as e:
-        result["login_error"] = str(e)[:200]
 
-    # open_dataset - credentials direkt parametre
-    try:
-        import inspect
-        sig = inspect.signature(copernicusmarine.open_dataset)
-        result["open_dataset_sig"] = str(sig)[:300]
+        return {
+            "ok": True,
+            "variables": list(ds.data_vars),
+            "dimensions": dict(ds.sizes),
+        }
+
     except Exception as e:
-        result["sig_error"] = str(e)[:100]
+        raise HTTPException(
+            status_code=502,
+            detail=str(e),
+        )
+
+
+@app.get("/marine")
+def marine(lat: float, lng: float):
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        raise HTTPException(
+            status_code=400,
+            detail="Geçersiz koordinat",
+        )
 
     try:
         ds = copernicusmarine.open_dataset(
             dataset_id="cmems_mod_glo_phy_anfc_0.083deg_P1D-m",
             username=CMEMS_USER,
             password=CMEMS_PASS,
+            variables=["tob"],
+            minimum_latitude=lat - 0.05,
+            maximum_latitude=lat + 0.05,
+            minimum_longitude=lng - 0.05,
+            maximum_longitude=lng + 0.05,
         )
-        result["ds_type"] = str(type(ds))
-        result["ds_none"] = ds is None
-        if ds is not None:
-            result["vars"] = list(ds.data_vars)
-            result["dims"] = dict(ds.sizes)
+
+        if ds is None:
+            raise HTTPException(
+                status_code=502,
+                detail="Copernicus veri döndürmedi",
+            )
+
+        if "tob" not in ds:
+            raise HTTPException(
+                status_code=502,
+                detail=f"tob bulunamadı: {list(ds.data_vars)}",
+            )
+
+        point = ds["tob"].sel(
+            latitude=lat,
+            longitude=lng,
+            method="nearest",
+        ).isel(time=-1)
+
+        value = float(point.compute().values)
+
+        if not math.isfinite(value):
+            return {
+                "ok": True,
+                "temperature": None,
+                "status": "no_data",
+            }
+
+        return {
+            "ok": True,
+            "lat": lat,
+            "lng": lng,
+            "temperature": value,
+            "unit": "°C",
+            "variable": "tob",
+        }
+
+    except HTTPException:
+        raise
+
     except Exception as e:
-        result["open_error"] = str(e)[:300]
-
-    return result
-
-
-@app.get("/marine")
-def marine(lat: float, lng: float):
-    return {"lat": lat, "lng": lng, "status": "coming soon"}
+        raise HTTPException(
+            status_code=502,
+            detail=str(e),
+        )
