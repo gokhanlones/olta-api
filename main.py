@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="OLTA Marine API",
-    version="3.1"
+    version="3.2"
 )
 
 app.add_middleware(
@@ -81,6 +81,12 @@ BGC_NUT_DATASET = (
 
 BGC_PFT_DATASET = (
     "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m"
+)
+
+# Zooplankton karbon biyokütlesi
+
+BGC_PLANKTON_DATASET = (
+    "cmems_mod_glo_bgc-plankton_anfc_0.25deg_P1D-m"
 )
 
 
@@ -214,6 +220,49 @@ def get_dataset_time(ds):
         return None
 
 
+def calculate_data_age_days(timestamp):
+
+    if not timestamp:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(timestamp).replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+
+        age = (now - parsed).total_seconds() / 86400
+
+        return round(age, 2)
+
+    except Exception:
+        return None
+
+
+def get_freshness_status(age_days):
+
+    if age_days is None:
+        return "unknown"
+
+    if age_days < 0:
+        return "future"
+
+    if age_days <= 3:
+        return "fresh"
+
+    if age_days <= 7:
+        return "recent"
+
+    if age_days <= 30:
+        return "stale"
+
+    return "very_stale"
+
+
 # ==================================================
 # BIOGEOCHEMISTRY HELPERS
 # ==================================================
@@ -226,8 +275,6 @@ def get_bgc_value(ds, variable, lat, lng):
         )
 
     data = ds[variable]
-
-    # Koordinat isimlerini belirle
 
     latitude_name = next(
         (
@@ -257,9 +304,6 @@ def get_bgc_value(ds, variable, lat, lng):
             method="nearest"
         )
 
-    # Güncel zamana en yakın veri
-    # Son zaman adımı gelecekteki tahmin olabilir.
-
     selected_time = None
 
     if "time" in data.dims:
@@ -277,8 +321,6 @@ def get_bgc_value(ds, variable, lat, lng):
             selected_time = str(data["time"].values)
         except Exception:
             selected_time = None
-
-    # İlk derinlik seviyesi: yüzeye en yakın model seviyesi
 
     if "depth" in data.dims:
         data = data.isel(depth=0)
@@ -483,7 +525,7 @@ def health():
     return {
         "status": "ok",
         "user": bool(CMEMS_USER),
-        "version": "3.1"
+        "version": "3.2"
     }
 
 
@@ -553,6 +595,13 @@ def debug(
         "bgc_pft": {
             "id": BGC_PFT_DATASET,
             "variables": ["phyc", "chl"],
+            "depth": True,
+            "buffer": 0.3
+        },
+
+        "bgc_plankton": {
+            "id": BGC_PLANKTON_DATASET,
+            "variables": ["zooc"],
             "depth": True,
             "buffer": 0.3
         }
@@ -894,6 +943,12 @@ def biogeochemistry(
         "primary_production": None,
         "primary_production_unit": "mg/m3/day",
 
+        "zooplankton": None,
+        "zooplankton_unit": "mmol/m3",
+        "zooplankton_time": None,
+        "zooplankton_age_days": None,
+        "zooplankton_freshness": "unknown",
+
         "surface_model_depth": None,
 
         "source_times": {},
@@ -1065,6 +1120,65 @@ def biogeochemistry(
             ds.close()
 
     # ----------------------------------------------
+    # 4. ZOOPLANKTON
+    # ----------------------------------------------
+
+    ds = None
+
+    try:
+
+        ds = get_dataset(
+            BGC_PLANKTON_DATASET,
+            ["zooc"],
+            lat,
+            lng,
+            depth=True,
+            buffer=0.3
+        )
+
+        zooplankton, zooplankton_time = get_bgc_value(
+            ds, "zooc", lat, lng
+        )
+
+        result["zooplankton"] = zooplankton
+        result["zooplankton_time"] = zooplankton_time
+
+        age_days = calculate_data_age_days(
+            zooplankton_time
+        )
+
+        result["zooplankton_age_days"] = age_days
+
+        result["zooplankton_freshness"] = (
+            get_freshness_status(age_days)
+        )
+
+        result["source_times"]["plankton"] = (
+            zooplankton_time
+        )
+
+        result["datasets"]["plankton"] = {
+            "ok": True,
+            "dataset_id": BGC_PLANKTON_DATASET,
+            "variables": list(ds.data_vars)
+        }
+
+    except Exception as e:
+
+        result["errors"]["plankton"] = str(e)[:500]
+
+        result["datasets"]["plankton"] = {
+            "ok": False,
+            "dataset_id": BGC_PLANKTON_DATASET,
+            "error": str(e)[:500]
+        }
+
+    finally:
+
+        if ds is not None:
+            ds.close()
+
+    # ----------------------------------------------
     # FINAL STATUS
     # ----------------------------------------------
 
@@ -1074,10 +1188,10 @@ def biogeochemistry(
     )
 
     result["successful_datasets"] = successful_datasets
-    result["total_datasets"] = 3
+    result["total_datasets"] = 4
 
     result["status"] = (
-        "ok" if successful_datasets == 3
+        "ok" if successful_datasets == 4
         else "partial" if successful_datasets > 0
         else "error"
     )
