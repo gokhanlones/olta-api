@@ -129,7 +129,6 @@ def debug():
     try:
         cat = copernicusmarine.describe(
             contains=["GLOBAL_ANALYSISFORECAST_PHY_001_024"],
-            include_all_versions=False,
         )
         result = []
         for p in cat.products[:2]:
