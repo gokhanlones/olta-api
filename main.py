@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="OLTA Marine API",
-    version="3.0"
+    version="3.1"
 )
 
 app.add_middleware(
@@ -46,19 +46,41 @@ CURRENTS_DATASET = (
     "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
 )
 
-# Karadeniz - güncel günlük 1 km
+# Karadeniz klorofil kaynakları
+
 CHL_BLACKSEA_NRT = (
     "cmems_obs-oc_blk_bgc-plankton_nrt_l4-gapfree-multi-1km_P1D"
 )
 
-# Karadeniz - geçmiş günlük 1 km
 CHL_BLACKSEA_HISTORY = (
     "cmems_obs-oc_blk_bgc-plankton_my_l4-gapfree-multi-1km_P1D"
 )
 
-# Küresel - günlük 4 km
 CHL_GLOBAL = (
     "cmems_obs-oc_glo_bgc-plankton_my_l4-gapfree-multi-4km_P1D"
+)
+
+
+# ==================================================
+# GLOBAL BIOGEOCHEMISTRY DATASETS
+# ==================================================
+
+# Oksijen + birincil üretim
+
+BGC_BIO_DATASET = (
+    "cmems_mod_glo_bgc-bio_anfc_0.25deg_P1D-m"
+)
+
+# Nitrat + fosfat
+
+BGC_NUT_DATASET = (
+    "cmems_mod_glo_bgc-nut_anfc_0.25deg_P1D-m"
+)
+
+# Fitoplankton + model klorofili
+
+BGC_PFT_DATASET = (
+    "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m"
 )
 
 
@@ -111,7 +133,8 @@ def get_dataset(
     lng,
     depth=False,
     start_date=None,
-    end_date=None
+    end_date=None,
+    buffer=0.1
 ):
 
     if not CMEMS_USER or not CMEMS_PASS:
@@ -125,11 +148,11 @@ def get_dataset(
         "password": CMEMS_PASS,
         "variables": variables,
 
-        "minimum_latitude": max(-90, lat - 0.1),
-        "maximum_latitude": min(90, lat + 0.1),
+        "minimum_latitude": max(-90, lat - buffer),
+        "maximum_latitude": min(90, lat + buffer),
 
-        "minimum_longitude": max(-180, lng - 0.1),
-        "maximum_longitude": min(180, lng + 0.1),
+        "minimum_longitude": max(-180, lng - buffer),
+        "maximum_longitude": min(180, lng + buffer),
     }
 
     if depth:
@@ -192,6 +215,96 @@ def get_dataset_time(ds):
 
 
 # ==================================================
+# BIOGEOCHEMISTRY HELPERS
+# ==================================================
+
+def get_bgc_value(ds, variable, lat, lng):
+
+    if variable not in ds:
+        raise Exception(
+            f"{variable} bulunamadı: {list(ds.data_vars)}"
+        )
+
+    data = ds[variable]
+
+    # Koordinat isimlerini belirle
+
+    latitude_name = next(
+        (
+            name for name in ["latitude", "lat"]
+            if name in data.dims
+        ),
+        None
+    )
+
+    longitude_name = next(
+        (
+            name for name in ["longitude", "lon"]
+            if name in data.dims
+        ),
+        None
+    )
+
+    if latitude_name:
+        data = data.sel(
+            {latitude_name: lat},
+            method="nearest"
+        )
+
+    if longitude_name:
+        data = data.sel(
+            {longitude_name: lng},
+            method="nearest"
+        )
+
+    # Güncel zamana en yakın veri
+    # Son zaman adımı gelecekteki tahmin olabilir.
+
+    selected_time = None
+
+    if "time" in data.dims:
+
+        target_time = datetime.now(
+            timezone.utc
+        ).replace(tzinfo=None)
+
+        data = data.sel(
+            time=target_time,
+            method="nearest"
+        )
+
+        try:
+            selected_time = str(data["time"].values)
+        except Exception:
+            selected_time = None
+
+    # İlk derinlik seviyesi: yüzeye en yakın model seviyesi
+
+    if "depth" in data.dims:
+        data = data.isel(depth=0)
+
+    raw_value = data.compute().values
+
+    value = float(raw_value)
+
+    if not math.isfinite(value):
+        value = None
+
+    return value, selected_time
+
+
+def get_bgc_surface_depth(ds):
+
+    if "depth" not in ds.coords:
+        return None
+
+    try:
+        return float(ds["depth"].values[0])
+    except Exception:
+        return None
+
+
+# ==================================================
 # CHLOROPHYLL HELPERS
 # ==================================================
 
@@ -231,7 +344,6 @@ def get_chlorophyll_records(
 
         data = ds["CHL"]
 
-        # Koordinat isimlerini otomatik bul
         latitude_name = next(
             (
                 name for name in ["latitude", "lat"]
@@ -277,7 +389,6 @@ def get_chlorophyll_records(
 
             value = float(raw_value)
 
-            # Geçersiz ve dolgu değerlerini ele
             if (
                 not math.isfinite(value)
                 or value <= 0
@@ -313,7 +424,6 @@ def get_chlorophyll_history_data(lat, lng, days):
     merged = {}
     source_status = {}
 
-    # Bölgesel kaynakları yalnızca kapsama alanında dene
     sources = []
 
     for source in CHL_SOURCES:
@@ -323,7 +433,6 @@ def get_chlorophyll_history_data(lat, lng, days):
 
         sources.append(source)
 
-    # Öncelik sırasına göre kaynakları birleştir
     for source in sources:
 
         records, error = get_chlorophyll_records(
@@ -348,7 +457,6 @@ def get_chlorophyll_history_data(lat, lng, days):
 
         for date, value in records.items():
 
-            # Daha öncelikli kaynağın geçerli verisini koru
             if value is not None:
 
                 if date not in merged or merged[date] is None:
@@ -375,7 +483,7 @@ def health():
     return {
         "status": "ok",
         "user": bool(CMEMS_USER),
-        "version": "3.0"
+        "version": "3.1"
     }
 
 
@@ -392,30 +500,61 @@ def debug(
     validate_coordinates(lat, lng)
 
     datasets = {
+
         "physics": {
             "id": PHYSICS_DATASET,
             "variables": ["tob", "sob", "mlotst", "zos"],
-            "depth": False
+            "depth": False,
+            "buffer": 0.1
         },
+
         "currents": {
             "id": CURRENTS_DATASET,
             "variables": ["uo", "vo"],
-            "depth": True
+            "depth": True,
+            "buffer": 0.1
         },
+
         "chlorophyll_blacksea_nrt": {
             "id": CHL_BLACKSEA_NRT,
             "variables": ["CHL"],
-            "depth": False
+            "depth": False,
+            "buffer": 0.1
         },
+
         "chlorophyll_blacksea_history": {
             "id": CHL_BLACKSEA_HISTORY,
             "variables": ["CHL"],
-            "depth": False
+            "depth": False,
+            "buffer": 0.1
         },
+
         "chlorophyll_global": {
             "id": CHL_GLOBAL,
             "variables": ["CHL"],
-            "depth": False
+            "depth": False,
+            "buffer": 0.1
+        },
+
+        "bgc_bio": {
+            "id": BGC_BIO_DATASET,
+            "variables": ["o2", "nppv"],
+            "depth": True,
+            "buffer": 0.3
+        },
+
+        "bgc_nut": {
+            "id": BGC_NUT_DATASET,
+            "variables": ["no3", "po4"],
+            "depth": True,
+            "buffer": 0.3
+        },
+
+        "bgc_pft": {
+            "id": BGC_PFT_DATASET,
+            "variables": ["phyc", "chl"],
+            "depth": True,
+            "buffer": 0.3
         }
     }
 
@@ -442,7 +581,8 @@ def debug(
                 config["variables"],
                 lat,
                 lng,
-                config["depth"]
+                config["depth"],
+                buffer=config["buffer"]
             )
 
             results[name] = {
@@ -509,9 +649,7 @@ def marine(
         "errors": {}
     }
 
-    # ----------------------------------------------
     # PHYSICAL DATA
-    # ----------------------------------------------
 
     ds = None
 
@@ -551,9 +689,7 @@ def marine(
         if ds is not None:
             ds.close()
 
-    # ----------------------------------------------
     # CURRENTS
-    # ----------------------------------------------
 
     ds = None
 
@@ -594,9 +730,7 @@ def marine(
         if ds is not None:
             ds.close()
 
-    # ----------------------------------------------
-    # CHLOROPHYLL - AUTOMATIC SOURCE SELECTION
-    # ----------------------------------------------
+    # CHLOROPHYLL
 
     try:
 
@@ -628,21 +762,18 @@ def marine(
         else:
 
             result["errors"]["chlorophyll"] = (
-                "Denemeye alınan kaynaklarda geçerli ölçüm bulunamadı."
+                "Geçerli klorofil ölçümü bulunamadı."
             )
 
     except Exception as e:
 
         result["errors"]["chlorophyll"] = str(e)[:500]
 
-    # ----------------------------------------------
     # FINAL STATUS
-    # ----------------------------------------------
 
-    if result["errors"]:
-        result["status"] = "partial"
-    else:
-        result["status"] = "ok"
+    result["status"] = (
+        "partial" if result["errors"] else "ok"
+    )
 
     return result
 
@@ -726,3 +857,229 @@ def chlorophyll_history(
         "source_status": source_status,
         "records": records
     }
+
+
+# ==================================================
+# BIOGEOCHEMISTRY API
+# ==================================================
+
+@app.get("/biogeochemistry")
+def biogeochemistry(
+    lat: float,
+    lng: float
+):
+
+    validate_coordinates(lat, lng)
+
+    result = {
+        "ok": True,
+        "lat": lat,
+        "lng": lng,
+
+        "oxygen": None,
+        "oxygen_unit": "mmol/m3",
+
+        "nitrate": None,
+        "nitrate_unit": "mmol/m3",
+
+        "phosphate": None,
+        "phosphate_unit": "mmol/m3",
+
+        "phytoplankton": None,
+        "phytoplankton_unit": "mmol/m3",
+
+        "model_chlorophyll": None,
+        "model_chlorophyll_unit": "mg/m3",
+
+        "primary_production": None,
+        "primary_production_unit": "mg/m3/day",
+
+        "surface_model_depth": None,
+
+        "source_times": {},
+        "datasets": {},
+        "errors": {}
+    }
+
+    # ----------------------------------------------
+    # 1. OXYGEN + PRIMARY PRODUCTION
+    # ----------------------------------------------
+
+    ds = None
+
+    try:
+
+        ds = get_dataset(
+            BGC_BIO_DATASET,
+            ["o2", "nppv"],
+            lat,
+            lng,
+            depth=True,
+            buffer=0.3
+        )
+
+        oxygen, oxygen_time = get_bgc_value(
+            ds, "o2", lat, lng
+        )
+
+        production, production_time = get_bgc_value(
+            ds, "nppv", lat, lng
+        )
+
+        result["oxygen"] = oxygen
+        result["primary_production"] = production
+
+        result["source_times"]["bio"] = (
+            oxygen_time or production_time
+        )
+
+        result["surface_model_depth"] = (
+            get_bgc_surface_depth(ds)
+        )
+
+        result["datasets"]["bio"] = {
+            "ok": True,
+            "dataset_id": BGC_BIO_DATASET,
+            "variables": list(ds.data_vars)
+        }
+
+    except Exception as e:
+
+        result["errors"]["bio"] = str(e)[:500]
+
+        result["datasets"]["bio"] = {
+            "ok": False,
+            "dataset_id": BGC_BIO_DATASET,
+            "error": str(e)[:500]
+        }
+
+    finally:
+
+        if ds is not None:
+            ds.close()
+
+    # ----------------------------------------------
+    # 2. NITRATE + PHOSPHATE
+    # ----------------------------------------------
+
+    ds = None
+
+    try:
+
+        ds = get_dataset(
+            BGC_NUT_DATASET,
+            ["no3", "po4"],
+            lat,
+            lng,
+            depth=True,
+            buffer=0.3
+        )
+
+        nitrate, nitrate_time = get_bgc_value(
+            ds, "no3", lat, lng
+        )
+
+        phosphate, phosphate_time = get_bgc_value(
+            ds, "po4", lat, lng
+        )
+
+        result["nitrate"] = nitrate
+        result["phosphate"] = phosphate
+
+        result["source_times"]["nut"] = (
+            nitrate_time or phosphate_time
+        )
+
+        result["datasets"]["nut"] = {
+            "ok": True,
+            "dataset_id": BGC_NUT_DATASET,
+            "variables": list(ds.data_vars)
+        }
+
+    except Exception as e:
+
+        result["errors"]["nut"] = str(e)[:500]
+
+        result["datasets"]["nut"] = {
+            "ok": False,
+            "dataset_id": BGC_NUT_DATASET,
+            "error": str(e)[:500]
+        }
+
+    finally:
+
+        if ds is not None:
+            ds.close()
+
+    # ----------------------------------------------
+    # 3. PHYTOPLANKTON + MODEL CHLOROPHYLL
+    # ----------------------------------------------
+
+    ds = None
+
+    try:
+
+        ds = get_dataset(
+            BGC_PFT_DATASET,
+            ["phyc", "chl"],
+            lat,
+            lng,
+            depth=True,
+            buffer=0.3
+        )
+
+        phytoplankton, phytoplankton_time = get_bgc_value(
+            ds, "phyc", lat, lng
+        )
+
+        model_chlorophyll, chl_time = get_bgc_value(
+            ds, "chl", lat, lng
+        )
+
+        result["phytoplankton"] = phytoplankton
+        result["model_chlorophyll"] = model_chlorophyll
+
+        result["source_times"]["pft"] = (
+            phytoplankton_time or chl_time
+        )
+
+        result["datasets"]["pft"] = {
+            "ok": True,
+            "dataset_id": BGC_PFT_DATASET,
+            "variables": list(ds.data_vars)
+        }
+
+    except Exception as e:
+
+        result["errors"]["pft"] = str(e)[:500]
+
+        result["datasets"]["pft"] = {
+            "ok": False,
+            "dataset_id": BGC_PFT_DATASET,
+            "error": str(e)[:500]
+        }
+
+    finally:
+
+        if ds is not None:
+            ds.close()
+
+    # ----------------------------------------------
+    # FINAL STATUS
+    # ----------------------------------------------
+
+    successful_datasets = sum(
+        1 for item in result["datasets"].values()
+        if item.get("ok")
+    )
+
+    result["successful_datasets"] = successful_datasets
+    result["total_datasets"] = 3
+
+    result["status"] = (
+        "ok" if successful_datasets == 3
+        else "partial" if successful_datasets > 0
+        else "error"
+    )
+
+    return result
