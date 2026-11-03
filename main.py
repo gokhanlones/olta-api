@@ -22,25 +22,12 @@ if CMEMS_USER:
 if CMEMS_PASS:
     os.environ["COPERNICUSMARINE_SERVICE_PASSWORD"] = CMEMS_PASS
 
-# Her değişken için doğru dataset ID
-PHYSICS_DATASETS = {
-    "thetao": "cmems_mod_glo_phy-thetao_anfc_0.083deg_PT6H-i",
-    "so":     "cmems_mod_glo_phy-so_anfc_0.083deg_PT6H-i",
-    "uo":     "cmems_mod_glo_phy-cur_anfc_0.083deg_PT6H-i",
-    "vo":     "cmems_mod_glo_phy-cur_anfc_0.083deg_PT6H-i",
-    "zos":    "cmems_mod_glo_phy-ssh_anfc_0.083deg_PT6H-i",
-    "mlotst": "cmems_mod_glo_phy-mnhcl_anfc_0.083deg_PT6H-i",
-}
+# Doğru dataset ID'leri
+PHY_DATASET = "cmems_mod_glo_phy_anfc_0.083deg_P1D-m"
+BGC_DATASET = "cmems_mod_glo_bgc_anfc_0.25deg_P1D-m"
 
-BGC_DATASETS = {
-    "chl":  "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m",
-    "phyc": "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m",
-    "o2":   "cmems_mod_glo_bgc-bio_anfc_0.25deg_P1D-m",
-    "no3":  "cmems_mod_glo_bgc-nut_anfc_0.25deg_P1D-m",
-    "po4":  "cmems_mod_glo_bgc-nut_anfc_0.25deg_P1D-m",
-    "ph":   "cmems_mod_glo_bgc-car_anfc_0.25deg_P1D-m",
-    "nppv": "cmems_mod_glo_bgc-pp_anfc_0.25deg_P1D-m",
-}
+PHYSICS_DATASETS = {v: PHY_DATASET for v in ["thetao","so","uo","vo","zos","mlotst"]}
+BGC_DATASETS     = {v: BGC_DATASET for v in ["chl","phyc","o2","no3","po4","ph","nppv"]}
 
 
 def get_cmems_value(dataset_id, variable, lat, lng):
