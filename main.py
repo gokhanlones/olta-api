@@ -113,17 +113,39 @@ def foodchain(spec_code: int):
 
 @app.get("/debug")
 def debug():
+    result = {}
+
+    # Test 1: sadece dataset_id ile dene
     try:
-        cat = copernicusmarine.describe(
-            contains=["GLOBAL_ANALYSISFORECAST_PHY_001_024"],
+        ds = copernicusmarine.open_dataset(
+            dataset_id="cmems_mod_glo_phy_anfc_0.083deg_P1D-m",
         )
-        result = []
-        for p in cat.products[:2]:
-            datasets = [d.dataset_id for d in p.datasets[:15]]
-            result.append({"product": p.product_id, "datasets": datasets})
-        return result
+        result["type"] = str(type(ds))
+        result["is_none"] = ds is None
+        if ds is not None:
+            result["vars"] = list(ds.data_vars)[:10]
     except Exception as e:
-        return {"error": str(e)[:300]}
+        result["test1_error"] = str(e)[:300]
+
+    # Test 2: coğrafi filtre + load()
+    try:
+        ds2 = copernicusmarine.open_dataset(
+            dataset_id="cmems_mod_glo_phy_anfc_0.083deg_P1D-m",
+            variables=["thetao"],
+            minimum_latitude=39.9,
+            maximum_latitude=40.1,
+            minimum_longitude=-30.1,
+            maximum_longitude=-29.9,
+        )
+        result["test2_type"] = str(type(ds2))
+        if ds2 is not None:
+            ds2.load()
+            val = float(ds2["thetao"].isel(time=-1).mean().values)
+            result["thetao"] = round(val, 3)
+    except Exception as e:
+        result["test2_error"] = str(e)[:300]
+
+    return result
 
 @app.get("/health")
 def health():
