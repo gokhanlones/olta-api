@@ -133,19 +133,34 @@ async def debug():
     except Exception as e:
         result["read_dataframe_error"] = str(e)[:300]
 
-    # open_dataset arco-geo-series service ile dene
+    # Login testi
     try:
-        ds = await loop.run_in_executor(
+        login_result = await loop.run_in_executor(
             executor,
-            lambda: copernicusmarine.open_dataset(
-                dataset_id=PHY_DATASET,
-                service="arco-geo-series",
+            lambda: copernicusmarine.login(
+                username=CMEMS_USER,
+                password=CMEMS_PASS,
+                overwrite_configuration_file=True,
             )
         )
-        result["arco_type"] = str(type(ds))
-        result["arco_is_none"] = ds is None
+        result["login_result"] = str(login_result)
+        result["login_type"] = str(type(login_result))
     except Exception as e:
-        result["arco_error"] = str(e)[:300]
+        result["login_error"] = str(e)[:300]
+
+    # Describe dene - catalog erişimi
+    try:
+        cat = await loop.run_in_executor(
+            executor,
+            lambda: copernicusmarine.describe(
+                contains=["GLOBAL_ANALYSISFORECAST_PHY"],
+            )
+        )
+        result["describe_type"] = str(type(cat))
+        if cat is not None and hasattr(cat, "products"):
+            result["products_count"] = len(cat.products)
+    except Exception as e:
+        result["describe_error"] = str(e)[:300]
 
     return result
 
