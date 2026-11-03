@@ -14,23 +14,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Copernicus kimlik bilgileri env var'dan al
+# Copernicusmarine 2.x doğru env var isimleri
 CMEMS_USER = os.environ.get("CMEMS_USERNAME")
 CMEMS_PASS = os.environ.get("CMEMS_PASSWORD")
 
-# Uygulama başlarken login yap
-@app.on_event("startup")
-async def startup():
-    try:
-        copernicusmarine.login(
-            username=CMEMS_USER,
-            password=CMEMS_PASS,
-            overwrite_configuration_file=True,
-            skip_if_user_logged_in=False,
-        )
-        print("Copernicus login OK")
-    except Exception as e:
-        print(f"Copernicus login FAILED: {e}")
+if CMEMS_USER:
+    os.environ["COPERNICUSMARINE_SERVICE_USERNAME"] = CMEMS_USER
+if CMEMS_PASS:
+    os.environ["COPERNICUSMARINE_SERVICE_PASSWORD"] = CMEMS_PASS
 
 
 def get_cmems_value(dataset_id, variable, lat, lng):
@@ -44,7 +35,6 @@ def get_cmems_value(dataset_id, variable, lat, lng):
             maximum_longitude=lng + 0.15,
         )
         arr = ds[variable].isel(time=-1)
-        # Derinlik boyutu varsa yüzey al
         if "depth" in arr.dims:
             arr = arr.isel(depth=0)
         val = float(arr.mean().values)
@@ -79,7 +69,6 @@ def marine(lat: float, lng: float):
         "biochemistry": {},
     }
 
-    # Fizik — Global Ocean Physics
     phys_dataset = "cmems_mod_glo_phy-all_anfc_0.083deg_PT6H-i"
     physics_vars = {
         "thetao": "sst",
@@ -92,16 +81,12 @@ def marine(lat: float, lng: float):
     for var, key in physics_vars.items():
         result["physics"][key] = get_cmems_value(phys_dataset, var, lat, lng)
 
-    # Akıntı hız ve yön
     uo = result["physics"].get("current_east")
     vo = result["physics"].get("current_north")
     if uo is not None and vo is not None:
-        result["physics"]["current_speed"] = round(math.sqrt(uo**2 + vo**2), 3)
-        result["physics"]["current_direction"] = round(
-            (math.degrees(math.atan2(uo, vo)) + 360) % 360, 1
-        )
+        result["physics"]["current_speed"]     = round(math.sqrt(uo**2 + vo**2), 3)
+        result["physics"]["current_direction"] = round((math.degrees(math.atan2(uo, vo)) + 360) % 360, 1)
 
-    # Biyokimya — Global BGC
     bgc_dataset = "cmems_mod_glo_bgc-all_anfc_0.25deg_P1D-m"
     bgc_vars = {
         "chl":  "chlorophyll",
@@ -125,4 +110,8 @@ def foodchain(spec_code: int):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "cmems_user": CMEMS_USER is not None}
+    return {
+        "status": "ok",
+        "cmems_user": bool(CMEMS_USER),
+        "env_set": bool(os.environ.get("COPERNICUSMARINE_SERVICE_USERNAME")),
+    }
