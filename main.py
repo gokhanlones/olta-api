@@ -54,11 +54,6 @@ def debug():
     try:
         ds = copernicusmarine.open_dataset(
             dataset_id="cmems_mod_glo_phy_anfc_0.083deg_P1D-m",
-            variables=["thetao"],
-            minimum_latitude=40.9,
-            maximum_latitude=41.1,
-            minimum_longitude=28.9,
-            maximum_longitude=29.1,
             username=CMEMS_USER,
             password=CMEMS_PASS,
         )
@@ -66,6 +61,7 @@ def debug():
         result["ds_none"] = ds is None
         if ds is not None:
             result["vars"] = list(ds.data_vars)
+            result["dims"] = dict(ds.sizes)
     except Exception as e:
         result["open_error"] = str(e)[:300]
 
