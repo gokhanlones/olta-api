@@ -321,7 +321,7 @@ def marine(lat: float, lng: float):
 # HABITAT GRID CONFIG
 # ==================================================
 
-HABITAT_GRID_STEP = 0.25
+HABITAT_GRID_STEP = 0.1
 HABITAT_REGION    = {"min_lat":35.0,"max_lat":42.5,"min_lng":25.0,"max_lng":42.0}
 HABITAT_CACHE_TTL = 3 * 60 * 60
 _habitat_cache      = {}
