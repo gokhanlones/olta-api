@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="3.4")
+app = FastAPI(title="OLTA Marine API", version="3.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -223,8 +223,8 @@ def get_chlorophyll_records(source, lat, lng, start_date, end_date):
 
 
 def get_chlorophyll_history_data(lat, lng, days):
-    now      = datetime.now(timezone.utc).replace(tzinfo=None)
-    end_date = now.strftime("%Y-%m-%dT23:59:59")
+    now        = datetime.now(timezone.utc).replace(tzinfo=None)
+    end_date   = now.strftime("%Y-%m-%dT23:59:59")
     start_date = (now - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
     merged = {}
     source_status = {}
@@ -255,7 +255,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "3.4"
+        "version":  "3.5"
     }
 
 # ==================================================
@@ -274,7 +274,6 @@ def marine(lat: float, lng: float):
         "chlorophyll": None, "chlorophyll_time": None,
         "chlorophyll_source": None, "errors": {}
     }
-    # Physics
     ds = None
     try:
         ds = get_dataset(PHYSICS_DATASET, ["tob","sob","mlotst","zos"], lat, lng)
@@ -287,7 +286,6 @@ def marine(lat: float, lng: float):
         result["errors"]["physics"] = str(e)[:500]
     finally:
         if ds: ds.close()
-    # Currents
     ds = None
     try:
         ds = get_dataset(CURRENTS_DATASET, ["uo","vo"], lat, lng, depth=True)
@@ -303,7 +301,6 @@ def marine(lat: float, lng: float):
         result["errors"]["currents"] = str(e)[:500]
     finally:
         if ds: ds.close()
-    # Chlorophyll
     try:
         history, source_status = get_chlorophyll_history_data(lat, lng, 30)
         valid_dates = [(d,i) for d,i in history.items() if i is not None]
@@ -418,7 +415,6 @@ def safe_grid_value(array, i, j):
 
 
 def build_habitat_response(species, region):
-    """Grid verisi hesapla ve dict olarak döndür."""
     latitudes  = np.round(np.arange(HABITAT_REGION["min_lat"],
                                     HABITAT_REGION["max_lat"] + 0.001,
                                     HABITAT_GRID_STEP), 4)
@@ -431,20 +427,20 @@ def build_habitat_response(species, region):
     errors         = {}
 
     for ds_id, vars_, depth_, key_temp, key_sal_or_var in [
-        (PHYSICS_DATASET,  ["tob","sob"], False, "tob",  "sob"),
-        (BGC_BIO_DATASET,  ["o2"],        True,  "o2",   None),
-        (BGC_PFT_DATASET,  ["chl"],       True,  "chl",  None),
+        (PHYSICS_DATASET, ["tob","sob"], False, "tob", "sob"),
+        (BGC_BIO_DATASET, ["o2"],        True,  "o2",  None),
+        (BGC_PFT_DATASET, ["chl"],       True,  "chl", None),
     ]:
         ds = None
         try:
             ds = get_regional_dataset(ds_id, vars_, depth=depth_)
-            arrays[{"tob":"temperature","o2":"oxygen","chl":"chlorophyll"}[key_temp]] = \
-                regional_data_to_grid(ds, key_temp, latitudes, longitudes)
+            k_map = {"tob":"temperature","o2":"oxygen","chl":"chlorophyll"}
+            arrays[k_map[key_temp]] = regional_data_to_grid(ds, key_temp, latitudes, longitudes)
             if key_sal_or_var:
                 arrays["salinity"] = regional_data_to_grid(ds, key_sal_or_var, latitudes, longitudes)
-            source_times[{"tob":"physics","o2":"oxygen","chl":"chlorophyll"}[key_temp]] = get_dataset_time(ds)
-            dataset_status[{"tob":"physics","o2":"oxygen","chl":"chlorophyll"}[key_temp]] = {
-                "ok":True,"dataset_id":ds_id}
+            t_map = {"tob":"physics","o2":"oxygen","chl":"chlorophyll"}
+            source_times[t_map[key_temp]]   = get_dataset_time(ds)
+            dataset_status[t_map[key_temp]] = {"ok":True,"dataset_id":ds_id}
         except Exception as e:
             k = {"tob":"physics","o2":"oxygen","chl":"chlorophyll"}[key_temp]
             errors[k]         = str(e)[:500]
@@ -512,7 +508,35 @@ def build_habitat_response(species, region):
     }
 
 # ==================================================
-# HABITAT GRID API (önce cache, sonra hesapla)
+# FIRESTORE YARDIMCI FONKSİYONLARI
+# ==================================================
+
+CHUNK_SIZE = 100  # Her chunk'ta max hücre sayısı
+
+
+def save_cells_to_firestore(doc_id, cells):
+    """cells dizisini chunk'lara bölerek Firestore sub-collection'a yaz."""
+    ref    = _db.collection("habitat_grids").document(doc_id)
+    chunks = [cells[i:i+CHUNK_SIZE] for i in range(0, len(cells), CHUNK_SIZE)]
+    batch  = _db.batch()
+    for idx, chunk in enumerate(chunks):
+        chunk_ref = ref.collection("chunks").document(str(idx))
+        batch.set(chunk_ref, {"cells": chunk, "index": idx})
+    batch.commit()
+    return len(chunks)
+
+
+def load_cells_from_firestore(doc_id):
+    """Firestore sub-collection'dan tüm chunk'ları oku, cells listesini döndür."""
+    ref    = _db.collection("habitat_grids").document(doc_id)
+    chunks = ref.collection("chunks").order_by("index").stream()
+    cells  = []
+    for chunk in chunks:
+        cells.extend(chunk.to_dict().get("cells", []))
+    return cells
+
+# ==================================================
+# HABITAT GRID API
 # ==================================================
 
 @app.get("/habitat-grid")
@@ -525,26 +549,31 @@ def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: boo
         raise HTTPException(status_code=400, detail="Şimdilik yalnızca turkey bölgesi destekleniyor.")
 
     cache_key = f"{species}:{region}"
+    doc_id    = f"{species}_{region}"
 
-    # 1. Önce Firestore'a bak
-    if not refresh and _db:
-        try:
-            snap = _db.collection("habitat_grids").document(f"{species}_{region}").get()
-            if snap.exists:
-                data = snap.to_dict()
-                data["cached"] = True
-                data["source"] = "firestore"
-                return data
-        except Exception as e:
-            print(f"Firestore read error: {e}")
-
-    # 2. Bellek cache
+    # 1. Bellek cache
     if not refresh:
         cached = get_habitat_cache(cache_key)
         if cached:
             response = dict(cached)
             response["cached"] = True
             return response
+
+    # 2. Firestore'dan metadata + cells oku
+    if not refresh and _db:
+        try:
+            snap = _db.collection("habitat_grids").document(doc_id).get()
+            if snap.exists:
+                data  = snap.to_dict()
+                cells = load_cells_from_firestore(doc_id)
+                if cells:
+                    data["cells"]  = cells
+                    data["cached"] = True
+                    data["source"] = "firestore"
+                    set_habitat_cache(cache_key, data)
+                    return data
+        except Exception as e:
+            print(f"Firestore read error: {e}")
 
     # 3. CMEMS'ten hesapla
     response = build_habitat_response(species, region)
@@ -562,14 +591,21 @@ def save_grid(species: str = "bluefish", region: str = "turkey", secret: str = "
     if not _db:
         raise HTTPException(status_code=500, detail="Firebase bağlı değil")
 
-    data = build_habitat_response(species, region)
+    data   = build_habitat_response(species, region)
+    doc_id = f"{species}_{region}"
+    ref    = _db.collection("habitat_grids").document(doc_id)
 
-    # Firestore'a kaydet
-    _db.collection("habitat_grids").document(f"{species}_{region}").set(data)
+    # Metadata'yı ana belgeye kaydet (cells hariç)
+    metadata = {k: v for k, v in data.items() if k != "cells"}
+    ref.set(metadata)
+
+    # cells'i chunk'lara bölerek sub-collection'a kaydet
+    num_chunks = save_cells_to_firestore(doc_id, data["cells"])
 
     return {
         "ok":           True,
         "saved_cells":  len(data["cells"]),
+        "chunks":       num_chunks,
         "generated_at": data["generated_at"],
         "species":      species,
         "region":       region,
