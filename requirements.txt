@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-copernicusmarine
-requests
-numpy
-xarray
-scipy
