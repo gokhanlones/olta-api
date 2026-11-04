@@ -4,3 +4,4 @@ copernicusmarine
 requests
 numpy
 xarray
+scipy
