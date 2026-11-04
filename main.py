@@ -1,8 +1,10 @@
-
 import os
 import math
+import time
+import threading
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import copernicusmarine
 
 from fastapi import FastAPI, HTTPException
@@ -15,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="OLTA Marine API",
-    version="3.2"
+    version="3.3"
 )
 
 app.add_middleware(
@@ -38,15 +40,9 @@ CMEMS_PASS = os.environ.get("CMEMS_PASSWORD")
 # DATASET IDS
 # ==================================================
 
-PHYSICS_DATASET = (
-    "cmems_mod_glo_phy_anfc_0.083deg_P1D-m"
-)
+PHYSICS_DATASET = "cmems_mod_glo_phy_anfc_0.083deg_P1D-m"
 
-CURRENTS_DATASET = (
-    "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
-)
-
-# Karadeniz klorofil kaynakları
+CURRENTS_DATASET = "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
 
 CHL_BLACKSEA_NRT = (
     "cmems_obs-oc_blk_bgc-plankton_nrt_l4-gapfree-multi-1km_P1D"
@@ -60,34 +56,13 @@ CHL_GLOBAL = (
     "cmems_obs-oc_glo_bgc-plankton_my_l4-gapfree-multi-4km_P1D"
 )
 
+BGC_BIO_DATASET = "cmems_mod_glo_bgc-bio_anfc_0.25deg_P1D-m"
 
-# ==================================================
-# GLOBAL BIOGEOCHEMISTRY DATASETS
-# ==================================================
+BGC_NUT_DATASET = "cmems_mod_glo_bgc-nut_anfc_0.25deg_P1D-m"
 
-# Oksijen + birincil üretim
+BGC_PFT_DATASET = "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m"
 
-BGC_BIO_DATASET = (
-    "cmems_mod_glo_bgc-bio_anfc_0.25deg_P1D-m"
-)
-
-# Nitrat + fosfat
-
-BGC_NUT_DATASET = (
-    "cmems_mod_glo_bgc-nut_anfc_0.25deg_P1D-m"
-)
-
-# Fitoplankton + model klorofili
-
-BGC_PFT_DATASET = (
-    "cmems_mod_glo_bgc-pft_anfc_0.25deg_P1D-m"
-)
-
-# Zooplankton karbon biyokütlesi
-
-BGC_PLANKTON_DATASET = (
-    "cmems_mod_glo_bgc-plankton_anfc_0.25deg_P1D-m"
-)
+BGC_PLANKTON_DATASET = "cmems_mod_glo_bgc-plankton_anfc_0.25deg_P1D-m"
 
 
 # ==================================================
@@ -183,15 +158,31 @@ def get_value(ds, variable, lat, lng):
 
     data = ds[variable]
 
-    if "latitude" in data.dims:
+    latitude_name = next(
+        (
+            name for name in ["latitude", "lat"]
+            if name in data.dims
+        ),
+        None
+    )
+
+    longitude_name = next(
+        (
+            name for name in ["longitude", "lon"]
+            if name in data.dims
+        ),
+        None
+    )
+
+    if latitude_name:
         data = data.sel(
-            latitude=lat,
+            {latitude_name: lat},
             method="nearest"
         )
 
-    if "longitude" in data.dims:
+    if longitude_name:
         data = data.sel(
-            longitude=lng,
+            {longitude_name: lng},
             method="nearest"
         )
 
@@ -201,7 +192,9 @@ def get_value(ds, variable, lat, lng):
     if "depth" in data.dims:
         data = data.isel(depth=0)
 
-    value = float(data.compute().values)
+    raw_value = data.compute().values
+
+    value = float(np.asarray(raw_value).squeeze())
 
     if not math.isfinite(value):
         return None
@@ -226,6 +219,7 @@ def calculate_data_age_days(timestamp):
         return None
 
     try:
+
         parsed = datetime.fromisoformat(
             str(timestamp).replace("Z", "+00:00")
         )
@@ -249,7 +243,7 @@ def get_freshness_status(age_days):
         return "unknown"
 
     if age_days < 0:
-        return "future"
+        return "forecast"
 
     if age_days <= 3:
         return "fresh"
@@ -327,7 +321,7 @@ def get_bgc_value(ds, variable, lat, lng):
 
     raw_value = data.compute().values
 
-    value = float(raw_value)
+    value = float(np.asarray(raw_value).squeeze())
 
     if not math.isfinite(value):
         value = None
@@ -420,7 +414,10 @@ def get_chlorophyll_records(
                 "CHL verisinde zaman boyutu bulunamadı."
             )
 
-        values = data.compute().values
+        values = np.asarray(
+            data.compute().values
+        ).reshape(-1)
+
         times = ds["time"].values
 
         records = {}
@@ -466,14 +463,13 @@ def get_chlorophyll_history_data(lat, lng, days):
     merged = {}
     source_status = {}
 
-    sources = []
-
-    for source in CHL_SOURCES:
-
-        if source["regional"] and not is_blacksea_region(lat, lng):
-            continue
-
-        sources.append(source)
+    sources = [
+        source for source in CHL_SOURCES
+        if not (
+            source["regional"]
+            and not is_blacksea_region(lat, lng)
+        )
+    ]
 
     for source in sources:
 
@@ -525,7 +521,7 @@ def health():
     return {
         "status": "ok",
         "user": bool(CMEMS_USER),
-        "version": "3.2"
+        "version": "3.3"
     }
 
 
@@ -615,10 +611,12 @@ def debug(
             name.startswith("chlorophyll_blacksea")
             and not is_blacksea_region(lat, lng)
         ):
+
             results[name] = {
                 "skipped": True,
                 "reason": "Koordinat Karadeniz veri alanı dışında."
             }
+
             continue
 
         ds = None
@@ -818,8 +816,6 @@ def marine(
 
         result["errors"]["chlorophyll"] = str(e)[:500]
 
-    # FINAL STATUS
-
     result["status"] = (
         "partial" if result["errors"] else "ok"
     )
@@ -956,231 +952,121 @@ def biogeochemistry(
         "errors": {}
     }
 
-    # ----------------------------------------------
-    # 1. OXYGEN + PRIMARY PRODUCTION
-    # ----------------------------------------------
-
-    ds = None
-
-    try:
-
-        ds = get_dataset(
+    configs = [
+        (
+            "bio",
             BGC_BIO_DATASET,
             ["o2", "nppv"],
-            lat,
-            lng,
-            depth=True,
-            buffer=0.3
-        )
-
-        oxygen, oxygen_time = get_bgc_value(
-            ds, "o2", lat, lng
-        )
-
-        production, production_time = get_bgc_value(
-            ds, "nppv", lat, lng
-        )
-
-        result["oxygen"] = oxygen
-        result["primary_production"] = production
-
-        result["source_times"]["bio"] = (
-            oxygen_time or production_time
-        )
-
-        result["surface_model_depth"] = (
-            get_bgc_surface_depth(ds)
-        )
-
-        result["datasets"]["bio"] = {
-            "ok": True,
-            "dataset_id": BGC_BIO_DATASET,
-            "variables": list(ds.data_vars)
-        }
-
-    except Exception as e:
-
-        result["errors"]["bio"] = str(e)[:500]
-
-        result["datasets"]["bio"] = {
-            "ok": False,
-            "dataset_id": BGC_BIO_DATASET,
-            "error": str(e)[:500]
-        }
-
-    finally:
-
-        if ds is not None:
-            ds.close()
-
-    # ----------------------------------------------
-    # 2. NITRATE + PHOSPHATE
-    # ----------------------------------------------
-
-    ds = None
-
-    try:
-
-        ds = get_dataset(
+            {
+                "oxygen": "o2",
+                "primary_production": "nppv"
+            }
+        ),
+        (
+            "nut",
             BGC_NUT_DATASET,
             ["no3", "po4"],
-            lat,
-            lng,
-            depth=True,
-            buffer=0.3
-        )
-
-        nitrate, nitrate_time = get_bgc_value(
-            ds, "no3", lat, lng
-        )
-
-        phosphate, phosphate_time = get_bgc_value(
-            ds, "po4", lat, lng
-        )
-
-        result["nitrate"] = nitrate
-        result["phosphate"] = phosphate
-
-        result["source_times"]["nut"] = (
-            nitrate_time or phosphate_time
-        )
-
-        result["datasets"]["nut"] = {
-            "ok": True,
-            "dataset_id": BGC_NUT_DATASET,
-            "variables": list(ds.data_vars)
-        }
-
-    except Exception as e:
-
-        result["errors"]["nut"] = str(e)[:500]
-
-        result["datasets"]["nut"] = {
-            "ok": False,
-            "dataset_id": BGC_NUT_DATASET,
-            "error": str(e)[:500]
-        }
-
-    finally:
-
-        if ds is not None:
-            ds.close()
-
-    # ----------------------------------------------
-    # 3. PHYTOPLANKTON + MODEL CHLOROPHYLL
-    # ----------------------------------------------
-
-    ds = None
-
-    try:
-
-        ds = get_dataset(
+            {
+                "nitrate": "no3",
+                "phosphate": "po4"
+            }
+        ),
+        (
+            "pft",
             BGC_PFT_DATASET,
             ["phyc", "chl"],
-            lat,
-            lng,
-            depth=True,
-            buffer=0.3
-        )
-
-        phytoplankton, phytoplankton_time = get_bgc_value(
-            ds, "phyc", lat, lng
-        )
-
-        model_chlorophyll, chl_time = get_bgc_value(
-            ds, "chl", lat, lng
-        )
-
-        result["phytoplankton"] = phytoplankton
-        result["model_chlorophyll"] = model_chlorophyll
-
-        result["source_times"]["pft"] = (
-            phytoplankton_time or chl_time
-        )
-
-        result["datasets"]["pft"] = {
-            "ok": True,
-            "dataset_id": BGC_PFT_DATASET,
-            "variables": list(ds.data_vars)
-        }
-
-    except Exception as e:
-
-        result["errors"]["pft"] = str(e)[:500]
-
-        result["datasets"]["pft"] = {
-            "ok": False,
-            "dataset_id": BGC_PFT_DATASET,
-            "error": str(e)[:500]
-        }
-
-    finally:
-
-        if ds is not None:
-            ds.close()
-
-    # ----------------------------------------------
-    # 4. ZOOPLANKTON
-    # ----------------------------------------------
-
-    ds = None
-
-    try:
-
-        ds = get_dataset(
+            {
+                "phytoplankton": "phyc",
+                "model_chlorophyll": "chl"
+            }
+        ),
+        (
+            "plankton",
             BGC_PLANKTON_DATASET,
             ["zooc"],
-            lat,
-            lng,
-            depth=True,
-            buffer=0.3
+            {
+                "zooplankton": "zooc"
+            }
         )
+    ]
 
-        zooplankton, zooplankton_time = get_bgc_value(
-            ds, "zooc", lat, lng
-        )
+    for name, dataset_id, variables, mapping in configs:
 
-        result["zooplankton"] = zooplankton
-        result["zooplankton_time"] = zooplankton_time
+        ds = None
 
-        age_days = calculate_data_age_days(
-            zooplankton_time
-        )
+        try:
 
-        result["zooplankton_age_days"] = age_days
+            ds = get_dataset(
+                dataset_id,
+                variables,
+                lat,
+                lng,
+                depth=True,
+                buffer=0.3
+            )
 
-        result["zooplankton_freshness"] = (
-            get_freshness_status(age_days)
-        )
+            selected_times = []
 
-        result["source_times"]["plankton"] = (
-            zooplankton_time
-        )
+            for output_name, variable in mapping.items():
 
-        result["datasets"]["plankton"] = {
-            "ok": True,
-            "dataset_id": BGC_PLANKTON_DATASET,
-            "variables": list(ds.data_vars)
-        }
+                value, selected_time = get_bgc_value(
+                    ds,
+                    variable,
+                    lat,
+                    lng
+                )
 
-    except Exception as e:
+                result[output_name] = value
 
-        result["errors"]["plankton"] = str(e)[:500]
+                if selected_time:
+                    selected_times.append(selected_time)
 
-        result["datasets"]["plankton"] = {
-            "ok": False,
-            "dataset_id": BGC_PLANKTON_DATASET,
-            "error": str(e)[:500]
-        }
+                if output_name == "zooplankton":
 
-    finally:
+                    result["zooplankton_time"] = selected_time
 
-        if ds is not None:
-            ds.close()
+                    age = calculate_data_age_days(
+                        selected_time
+                    )
 
-    # ----------------------------------------------
-    # FINAL STATUS
-    # ----------------------------------------------
+                    result["zooplankton_age_days"] = age
+
+                    result["zooplankton_freshness"] = (
+                        get_freshness_status(age)
+                    )
+
+            result["source_times"][name] = (
+                selected_times[0]
+                if selected_times
+                else get_dataset_time(ds)
+            )
+
+            if name == "bio":
+
+                result["surface_model_depth"] = (
+                    get_bgc_surface_depth(ds)
+                )
+
+            result["datasets"][name] = {
+                "ok": True,
+                "dataset_id": dataset_id,
+                "variables": list(ds.data_vars)
+            }
+
+        except Exception as e:
+
+            result["errors"][name] = str(e)[:500]
+
+            result["datasets"][name] = {
+                "ok": False,
+                "dataset_id": dataset_id,
+                "error": str(e)[:500]
+            }
+
+        finally:
+
+            if ds is not None:
+                ds.close()
 
     successful_datasets = sum(
         1 for item in result["datasets"].values()
@@ -1197,3 +1083,671 @@ def biogeochemistry(
     )
 
     return result
+
+
+# ==================================================
+# HABITAT GRID CONFIGURATION
+# ==================================================
+
+HABITAT_GRID_STEP = 0.25
+
+HABITAT_REGION = {
+    "min_lat": 35.0,
+    "max_lat": 42.5,
+    "min_lng": 25.0,
+    "max_lng": 42.0
+}
+
+HABITAT_CACHE_TTL = 3 * 60 * 60
+
+_habitat_cache = {}
+
+_habitat_cache_lock = threading.Lock()
+
+
+# ==================================================
+# HABITAT CACHE
+# ==================================================
+
+def get_habitat_cache(key):
+
+    with _habitat_cache_lock:
+
+        item = _habitat_cache.get(key)
+
+        if not item:
+            return None
+
+        if time.time() - item["created"] > HABITAT_CACHE_TTL:
+
+            del _habitat_cache[key]
+
+            return None
+
+        return item["data"]
+
+
+def set_habitat_cache(key, data):
+
+    with _habitat_cache_lock:
+
+        _habitat_cache[key] = {
+            "created": time.time(),
+            "data": data
+        }
+
+
+# ==================================================
+# HABITAT REGIONAL DATA HELPERS
+# ==================================================
+
+def get_coordinate_name(ds, candidates):
+
+    for name in candidates:
+
+        if name in ds.coords or name in ds.dims:
+            return name
+
+    return None
+
+
+def get_regional_dataset(
+    dataset_id,
+    variables,
+    depth=False
+):
+
+    if not CMEMS_USER or not CMEMS_PASS:
+
+        raise Exception(
+            "Copernicus kullanıcı bilgileri tanımlanmamış."
+        )
+
+    params = {
+        "dataset_id": dataset_id,
+        "username": CMEMS_USER,
+        "password": CMEMS_PASS,
+        "variables": variables,
+
+        "minimum_latitude": HABITAT_REGION["min_lat"],
+        "maximum_latitude": HABITAT_REGION["max_lat"],
+
+        "minimum_longitude": HABITAT_REGION["min_lng"],
+        "maximum_longitude": HABITAT_REGION["max_lng"]
+    }
+
+    if depth:
+
+        params["minimum_depth"] = 0
+        params["maximum_depth"] = 5
+
+    return copernicusmarine.open_dataset(**params)
+
+
+def regional_data_to_grid(
+    ds,
+    variable,
+    target_latitudes,
+    target_longitudes
+):
+
+    if variable not in ds:
+
+        raise Exception(
+            f"{variable} değişkeni bulunamadı."
+        )
+
+    latitude_name = get_coordinate_name(
+        ds,
+        ["latitude", "lat"]
+    )
+
+    longitude_name = get_coordinate_name(
+        ds,
+        ["longitude", "lon"]
+    )
+
+    if not latitude_name or not longitude_name:
+
+        raise Exception(
+            "Enlem/boylam koordinatları bulunamadı."
+        )
+
+    data = ds[variable]
+
+    if "time" in data.dims:
+
+        data = data.sortby("time")
+        data = data.isel(time=-1)
+
+    if "depth" in data.dims:
+
+        data = data.sortby("depth")
+        data = data.isel(depth=0)
+
+    data = data.squeeze(drop=True)
+
+    data = data.sortby(latitude_name)
+    data = data.sortby(longitude_name)
+
+    interpolated = data.interp(
+        {
+            latitude_name: target_latitudes,
+            longitude_name: target_longitudes
+        },
+        method="nearest"
+    )
+
+    values = np.asarray(
+        interpolated.compute().values,
+        dtype=float
+    )
+
+    values[~np.isfinite(values)] = np.nan
+
+    expected_shape = (
+        len(target_latitudes),
+        len(target_longitudes)
+    )
+
+    if values.shape != expected_shape:
+
+        raise Exception(
+            f"{variable} grid boyutu beklenenden farklı: "
+            f"{values.shape}"
+        )
+
+    return values
+
+
+# ==================================================
+# BLUEFISH HABITAT MODEL
+# ==================================================
+
+def bluefish_temperature_score(temperature):
+
+    """
+    Geçici sıcaklık uygunluk modeli.
+
+    8.4 - 27.5 C:
+    Geniş modellenmiş sıcaklık aralığı.
+
+    21.1 C:
+    Bildirilen ortalama değer.
+
+    Bunlar yetişkin lüfer için doğrulanmış optimum
+    sıcaklık eşikleri değildir.
+    """
+
+    if temperature is None:
+        return None
+
+    if not math.isfinite(temperature):
+        return None
+
+    minimum = 8.4
+    maximum = 27.5
+    center = 21.1
+
+    if temperature < minimum or temperature > maximum:
+        return 0.0
+
+    if temperature <= center:
+
+        score = (
+            (temperature - minimum)
+            / (center - minimum)
+        ) * 100
+
+    else:
+
+        score = (
+            (maximum - temperature)
+            / (maximum - center)
+        ) * 100
+
+    return round(
+        max(0.0, min(100.0, score)),
+        1
+    )
+
+
+def get_habitat_level(score):
+
+    if score is None:
+        return "insufficient_data"
+
+    if score >= 75:
+        return "high"
+
+    if score >= 50:
+        return "moderate"
+
+    if score >= 25:
+        return "low"
+
+    return "very_low"
+
+
+def safe_grid_value(array, i, j):
+
+    if array is None:
+        return None
+
+    value = float(array[i, j])
+
+    if not math.isfinite(value):
+        return None
+
+    return value
+
+
+# ==================================================
+# HABITAT GRID API
+# ==================================================
+
+@app.get("/habitat-grid")
+def habitat_grid(
+    species: str = "bluefish",
+    region: str = "turkey",
+    refresh: bool = False
+):
+
+    species = species.lower().strip()
+    region = region.lower().strip()
+
+    if species != "bluefish":
+
+        raise HTTPException(
+            status_code=400,
+            detail="Şimdilik yalnızca bluefish destekleniyor."
+        )
+
+    if region != "turkey":
+
+        raise HTTPException(
+            status_code=400,
+            detail="Şimdilik yalnızca turkey bölgesi destekleniyor."
+        )
+
+    cache_key = f"{species}:{region}"
+
+    if not refresh:
+
+        cached = get_habitat_cache(cache_key)
+
+        if cached is not None:
+
+            response = dict(cached)
+            response["cached"] = True
+
+            return response
+
+    # --------------------------------------------------
+    # TARGET GRID
+    # --------------------------------------------------
+
+    latitudes = np.round(
+        np.arange(
+            HABITAT_REGION["min_lat"],
+            HABITAT_REGION["max_lat"] + 0.001,
+            HABITAT_GRID_STEP
+        ),
+        4
+    )
+
+    longitudes = np.round(
+        np.arange(
+            HABITAT_REGION["min_lng"],
+            HABITAT_REGION["max_lng"] + 0.001,
+            HABITAT_GRID_STEP
+        ),
+        4
+    )
+
+    # --------------------------------------------------
+    # DATA CONTAINERS
+    # --------------------------------------------------
+
+    arrays = {
+        "temperature": None,
+        "salinity": None,
+        "oxygen": None,
+        "chlorophyll": None
+    }
+
+    source_times = {}
+    dataset_status = {}
+    errors = {}
+
+    # --------------------------------------------------
+    # 1. PHYSICAL DATA
+    # --------------------------------------------------
+
+    ds = None
+
+    try:
+
+        ds = get_regional_dataset(
+            PHYSICS_DATASET,
+            ["tob", "sob"],
+            depth=False
+        )
+
+        arrays["temperature"] = regional_data_to_grid(
+            ds,
+            "tob",
+            latitudes,
+            longitudes
+        )
+
+        arrays["salinity"] = regional_data_to_grid(
+            ds,
+            "sob",
+            latitudes,
+            longitudes
+        )
+
+        source_times["physics"] = get_dataset_time(ds)
+
+        dataset_status["physics"] = {
+            "ok": True,
+            "dataset_id": PHYSICS_DATASET
+        }
+
+    except Exception as e:
+
+        errors["physics"] = str(e)[:500]
+
+        dataset_status["physics"] = {
+            "ok": False,
+            "error": str(e)[:500]
+        }
+
+    finally:
+
+        if ds is not None:
+            ds.close()
+
+    # --------------------------------------------------
+    # 2. OXYGEN
+    # --------------------------------------------------
+
+    ds = None
+
+    try:
+
+        ds = get_regional_dataset(
+            BGC_BIO_DATASET,
+            ["o2"],
+            depth=True
+        )
+
+        arrays["oxygen"] = regional_data_to_grid(
+            ds,
+            "o2",
+            latitudes,
+            longitudes
+        )
+
+        source_times["oxygen"] = get_dataset_time(ds)
+
+        dataset_status["oxygen"] = {
+            "ok": True,
+            "dataset_id": BGC_BIO_DATASET
+        }
+
+    except Exception as e:
+
+        errors["oxygen"] = str(e)[:500]
+
+        dataset_status["oxygen"] = {
+            "ok": False,
+            "error": str(e)[:500]
+        }
+
+    finally:
+
+        if ds is not None:
+            ds.close()
+
+    # --------------------------------------------------
+    # 3. MODEL CHLOROPHYLL
+    # --------------------------------------------------
+
+    ds = None
+
+    try:
+
+        ds = get_regional_dataset(
+            BGC_PFT_DATASET,
+            ["chl"],
+            depth=True
+        )
+
+        arrays["chlorophyll"] = regional_data_to_grid(
+            ds,
+            "chl",
+            latitudes,
+            longitudes
+        )
+
+        source_times["chlorophyll"] = get_dataset_time(ds)
+
+        dataset_status["chlorophyll"] = {
+            "ok": True,
+            "dataset_id": BGC_PFT_DATASET
+        }
+
+    except Exception as e:
+
+        errors["chlorophyll"] = str(e)[:500]
+
+        dataset_status["chlorophyll"] = {
+            "ok": False,
+            "error": str(e)[:500]
+        }
+
+    finally:
+
+        if ds is not None:
+            ds.close()
+
+    # --------------------------------------------------
+    # 4. BUILD GRID CELLS
+    # --------------------------------------------------
+
+    cells = []
+
+    total_cells = 0
+    scored_cells = 0
+
+    half = HABITAT_GRID_STEP / 2
+
+    for i, lat in enumerate(latitudes):
+
+        for j, lng in enumerate(longitudes):
+
+            temperature = safe_grid_value(
+                arrays["temperature"], i, j
+            )
+
+            salinity = safe_grid_value(
+                arrays["salinity"], i, j
+            )
+
+            oxygen = safe_grid_value(
+                arrays["oxygen"], i, j
+            )
+
+            chlorophyll = safe_grid_value(
+                arrays["chlorophyll"], i, j
+            )
+
+            # Fiziksel deniz verisi bulunmayan
+            # hücreleri haritaya dahil etme.
+
+            if temperature is None and salinity is None:
+                continue
+
+            total_cells += 1
+
+            score = bluefish_temperature_score(
+                temperature
+            )
+
+            available_core = sum(
+                value is not None
+                for value in (
+                    temperature,
+                    salinity,
+                    oxygen
+                )
+            )
+
+            completeness = round(
+                (available_core / 3) * 100
+            )
+
+            if score is not None:
+                scored_cells += 1
+
+            cells.append({
+
+                "lat": round(float(lat), 4),
+                "lng": round(float(lng), 4),
+
+                "bounds": {
+                    "south": round(float(lat - half), 4),
+                    "west": round(float(lng - half), 4),
+                    "north": round(float(lat + half), 4),
+                    "east": round(float(lng + half), 4)
+                },
+
+                "temperature": (
+                    round(temperature, 3)
+                    if temperature is not None
+                    else None
+                ),
+
+                "salinity": (
+                    round(salinity, 3)
+                    if salinity is not None
+                    else None
+                ),
+
+                "oxygen": (
+                    round(oxygen, 3)
+                    if oxygen is not None
+                    else None
+                ),
+
+                "oxygen_mg_l": (
+                    round(oxygen * 0.032, 3)
+                    if oxygen is not None
+                    else None
+                ),
+
+                "chlorophyll": (
+                    round(chlorophyll, 3)
+                    if chlorophyll is not None
+                    else None
+                ),
+
+                "score": score,
+
+                "level": get_habitat_level(score),
+
+                "data_completeness": completeness
+            })
+
+    # --------------------------------------------------
+    # 5. VALIDATION
+    # --------------------------------------------------
+
+    if not cells:
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": (
+                    "Habitat grid oluşturulamadı. "
+                    "Deniz hücresi verisi alınamadı."
+                ),
+                "errors": errors
+            }
+        )
+
+    # --------------------------------------------------
+    # 6. RESPONSE
+    # --------------------------------------------------
+
+    response = {
+
+        "ok": True,
+
+        "species": {
+            "id": "bluefish",
+            "name": "Lüfer",
+            "scientific_name": "Pomatomus saltatrix",
+            "life_stage": "adult",
+            "color": "#1687FF"
+        },
+
+        "region": "turkey",
+
+        "grid": {
+            "step_degrees": HABITAT_GRID_STEP,
+            "latitude_count": len(latitudes),
+            "longitude_count": len(longitudes),
+            "total_cells": total_cells,
+            "scored_cells": scored_cells
+        },
+
+        "model": {
+
+            "version": "0.1",
+
+            "type": "provisional_temperature_suitability",
+
+            "score_type": (
+                "habitat_suitability_not_probability"
+            ),
+
+            "temperature": {
+                "minimum_modeled_range": 8.4,
+                "maximum_modeled_range": 27.5,
+                "reported_mean": 21.1,
+                "unit": "C"
+            },
+
+            "limitations": [
+                "Skor balığın gerçek varlığını veya yakalanma olasılığını göstermez.",
+                "Sıcaklık modeli geçicidir.",
+                "Yetişkin lüfer için doğrulanmış optimum eşikler henüz kullanılmamaktadır.",
+                "Oksijen, tuzluluk ve klorofil şimdilik bilgi amaçlıdır.",
+                "Hücre çözünürlüğü yaklaşık 0.25 derecedir."
+            ]
+        },
+
+        "source_times": source_times,
+
+        "datasets": dataset_status,
+
+        "errors": errors,
+
+        "cells": cells,
+
+        "cached": False,
+
+        "generated_at": datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
+
+    set_habitat_cache(
+        cache_key,
+        response
+    )
+
+    return response
