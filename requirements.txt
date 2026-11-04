@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+copernicusmarine
+requests
+numpy
+xarray
+firebase-admin
