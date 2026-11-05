@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="3.8")
+app = FastAPI(title="OLTA Marine API", version="3.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -327,7 +327,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "3.8"
+        "version":  "3.9"
     }
 
 # ==================================================
@@ -533,15 +533,70 @@ def regional_data_to_grid(ds, variable, target_latitudes, target_longitudes):
     return values
 
 
-def bluefish_temperature_score(temperature):
-    if temperature is None or not math.isfinite(temperature): return None
-    minimum, maximum, center = 8.4, 27.5, 21.1
-    if temperature < minimum or temperature > maximum: return 0.0
-    if temperature <= center:
-        score = (temperature - minimum) / (center - minimum) * 100
-    else:
-        score = (maximum - temperature) / (maximum - center) * 100
-    return round(max(0.0, min(100.0, score)), 1)
+# ---- UYGUNLUK SKORU ------------------------------------------------------
+# Ön yüzdeki (forecast.html) scoreFishCell ile BİREBİR aynı formül:
+#   aralık skoru = merkezde 100, sınırlarda 0 (üçgen), aralık dışı 0
+#   skor = sıcaklık %70 + tuzluluk %30 (tuzluluk aralığı/verisi yoksa yalnızca sıcaklık)
+# Tür aralıkları ön yüzün de okuduğu Firestore `fish` koleksiyonundan gelir.
+
+SCORE_WEIGHTS = {"temperature": 0.7, "salinity": 0.3}
+SPECIES_DEFAULTS = {
+    # Firestore okunamazsa kullanılacak yedek aralıklar
+    "bluefish": {"name": "Lüfer", "sstMin": 8.4, "sstMax": 27.5, "sssMin": None, "sssMax": None},
+}
+SPECIES_PARAMS_TTL = 6 * 60 * 60
+_species_params_cache = {}
+
+
+def get_species_params(species):
+    """Türün sıcaklık/tuzluluk aralıklarını Firestore'dan oku (6 saat önbellek)."""
+    default = SPECIES_DEFAULTS[species]
+    cached = _species_params_cache.get(species)
+    if cached and time.time() - cached["created"] < SPECIES_PARAMS_TTL:
+        return cached["params"]
+    params = {**default, "source": "default"}
+    if _db is not None:
+        try:
+            docs = _db.collection("fish").where("name", "==", default["name"]).limit(1).stream()
+            for doc in docs:
+                d = doc.to_dict()
+                if d.get("sstMin") is not None and d.get("sstMax") is not None:
+                    params = {
+                        "name":   default["name"],
+                        "sstMin": float(d["sstMin"]), "sstMax": float(d["sstMax"]),
+                        "sssMin": float(d["sssMin"]) if d.get("sssMin") is not None else None,
+                        "sssMax": float(d["sssMax"]) if d.get("sssMax") is not None else None,
+                        "source": "firestore",
+                    }
+        except Exception as e:
+            print(f"Tür parametreleri okunamadı: {e}")
+    _species_params_cache[species] = {"created": time.time(), "params": params}
+    return params
+
+
+def range_score(value, minimum, maximum):
+    if value is None or minimum is None or maximum is None or maximum <= minimum:
+        return None
+    if value < minimum or value > maximum:
+        return 0.0
+    center     = (minimum + maximum) / 2
+    half_range = (maximum - minimum) / 2
+    return max(0.0, (1 - abs(value - center) / half_range) * 100)
+
+
+def js_round(x):
+    """JavaScript Math.round ile aynı (Python round() yarımları çifte yuvarlar)."""
+    return int(math.floor(x + 0.5))
+
+
+def habitat_score(temperature, salinity, params):
+    sst = range_score(temperature, params["sstMin"], params["sstMax"])
+    if sst is None:
+        return None
+    sss = range_score(salinity, params["sssMin"], params["sssMax"])
+    if sss is not None:
+        return js_round(sst * SCORE_WEIGHTS["temperature"] + sss * SCORE_WEIGHTS["salinity"])
+    return js_round(sst)
 
 
 def get_habitat_level(score):
@@ -565,7 +620,8 @@ def build_habitat_response(species, region):
     longitudes = np.round(np.arange(HABITAT_REGION["min_lng"],
                                     HABITAT_REGION["max_lng"] + 0.001,
                                     HABITAT_GRID_STEP), 4)
-    arrays         = {"temperature":None,"salinity":None,"oxygen":None,"chlorophyll":None}
+    arrays         = {"temperature":None,"salinity":None,"oxygen":None,"chlorophyll":None,
+                      "current_u":None,"current_v":None}
     source_times   = {}
     dataset_status = {}
     errors         = {}
@@ -598,6 +654,22 @@ def build_habitat_response(species, region):
         elif attempt_errors:
             errors[f"{key}_primary"] = " | ".join(attempt_errors)[:1000]
 
+    # Akıntı (u: doğuya, v: kuzeye; m/s) — tek sette iki bileşen
+    ds = None
+    try:
+        ds = get_regional_dataset(CURRENTS_DATASET, ["uo", "vo"], depth=True)
+        arrays["current_u"]        = regional_data_to_grid(ds, "uo", latitudes, longitudes)
+        arrays["current_v"]        = regional_data_to_grid(ds, "vo", latitudes, longitudes)
+        source_times["currents"]   = get_dataset_time(ds)
+        dataset_status["currents"] = {"ok": True, "dataset_id": CURRENTS_DATASET}
+    except Exception as e:
+        errors["currents"]         = str(e)[:500]
+        dataset_status["currents"] = {"ok": False, "error": errors["currents"]}
+    finally:
+        if ds: ds.close()
+
+    params = get_species_params(species)
+
     cells        = []
     total_cells  = 0
     scored_cells = 0
@@ -609,10 +681,12 @@ def build_habitat_response(species, region):
             salinity    = safe_grid_value(arrays["salinity"],    i, j)
             oxygen      = safe_grid_value(arrays["oxygen"],      i, j)
             chlorophyll = safe_grid_value(arrays["chlorophyll"], i, j)
+            current_u   = safe_grid_value(arrays["current_u"],   i, j)
+            current_v   = safe_grid_value(arrays["current_v"],   i, j)
             if temperature is None and salinity is None:
                 continue
             total_cells += 1
-            score        = bluefish_temperature_score(temperature)
+            score        = habitat_score(temperature, salinity, params)
             completeness = round(sum(v is not None for v in (temperature,salinity,oxygen)) / 3 * 100)
             if score is not None: scored_cells += 1
             cells.append({
@@ -626,6 +700,8 @@ def build_habitat_response(species, region):
                 "oxygen":      round(oxygen,3)      if oxygen      is not None else None,
                 "oxygen_mg_l": round(oxygen*0.032,3)if oxygen      is not None else None,
                 "chlorophyll": round(chlorophyll,3) if chlorophyll is not None else None,
+                "current_u":   round(current_u,3)   if current_u   is not None else None,
+                "current_v":   round(current_v,3)   if current_v   is not None else None,
                 "score": score,
                 "level": get_habitat_level(score),
                 "data_completeness": completeness,
@@ -642,10 +718,13 @@ def build_habitat_response(species, region):
         "grid": {"step_degrees":HABITAT_GRID_STEP,"latitude_count":len(latitudes),
                  "longitude_count":len(longitudes),"total_cells":total_cells,"scored_cells":scored_cells},
         "model": {
-            "version":"0.2","type":"provisional_temperature_suitability",
+            "version":"0.3","type":"temperature_salinity_range_suitability",
             "score_type":"habitat_suitability_not_probability",
-            "temperature":{"minimum_modeled_range":8.4,"maximum_modeled_range":27.5,
-                           "reported_mean":21.1,"unit":"C"},
+            "formula":"temperature_range_score*0.7 + salinity_range_score*0.3 (tuzluluk yoksa yalnızca sıcaklık)",
+            "weights": SCORE_WEIGHTS,
+            "temperature":{"min":params["sstMin"],"max":params["sstMax"],"unit":"C"},
+            "salinity":{"min":params["sssMin"],"max":params["sssMax"],"unit":"PSU"},
+            "parameters_source": params["source"],
             "limitations":[
                 "Skor balığın gerçek varlığını veya yakalanma olasılığını göstermez.",
                 "Çevresel uygunluk göstergesidir, av garantisi değildir.",
