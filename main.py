@@ -4,6 +4,7 @@ import json
 import math
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -19,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="3.7")
+app = FastAPI(title="OLTA Marine API", version="3.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -326,7 +327,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "3.7"
+        "version":  "3.8"
     }
 
 # ==================================================
@@ -338,29 +339,90 @@ _marine_cache      = {}
 _marine_cache_lock = threading.Lock()
 
 
-def read_surface_point(result, key, dataset_id, variable, fallback_variable, lat, lng):
+MARINE_WORKERS = 5   # /marine'daki bağımsız veri seti okumaları paralel çalışır
+
+
+# Her okuyucu (alanlar, hatalar) döndürür; ortak sözlüğe dokunmaz (thread güvenli).
+
+def read_physics_point(lat, lng):
+    fields, errors = {}, {}
+    ds = None
+    try:
+        ds = get_dataset(PHYSICS_DATASET, ["mlotst","zos"], lat, lng)
+        fields["mixing_layer_depth"] = get_value(ds, "mlotst", lat, lng)
+        fields["sea_level"]          = get_value(ds, "zos",    lat, lng)
+        fields["physics_time"]       = get_dataset_time(ds)
+    except Exception as e:
+        errors["physics"] = str(e)[:500]
+    finally:
+        if ds: ds.close()
+    return fields, errors
+
+
+def read_surface_point(key, dataset_id, variable, fallback_variable, lat, lng):
     """Yüzey değerini oku; set açılamazsa 2D fizik setindeki dip değerine düş."""
+    fields, errors = {}, {}
     ds = None
     try:
         ds = get_dataset(dataset_id, [variable], lat, lng, depth=True)
-        result[key] = get_value(ds, variable, lat, lng)
-        result[f"{key}_source"] = "surface"
-        result[f"{key}_time"]   = get_dataset_time(ds)
-        return
+        fields[key] = get_value(ds, variable, lat, lng)
+        fields[f"{key}_source"] = "surface"
+        fields[f"{key}_time"]   = get_dataset_time(ds)
+        return fields, errors
     except Exception as e:
-        result["errors"][key] = str(e)[:500]
+        errors[key] = str(e)[:500]
     finally:
         if ds: ds.close()
     ds = None
     try:
         ds = get_dataset(PHYSICS_DATASET, [fallback_variable], lat, lng)
-        result[key] = get_value(ds, fallback_variable, lat, lng)
-        result[f"{key}_source"] = "bottom_fallback"
-        result[f"{key}_time"]   = get_dataset_time(ds)
+        fields[key] = get_value(ds, fallback_variable, lat, lng)
+        fields[f"{key}_source"] = "bottom_fallback"
+        fields[f"{key}_time"]   = get_dataset_time(ds)
     except Exception as e:
-        result["errors"][f"{key}_fallback"] = str(e)[:500]
+        errors[f"{key}_fallback"] = str(e)[:500]
     finally:
         if ds: ds.close()
+    return fields, errors
+
+
+def read_currents_point(lat, lng):
+    fields, errors = {}, {}
+    ds = None
+    try:
+        ds = get_dataset(CURRENTS_DATASET, ["uo","vo"], lat, lng, depth=True)
+        u = get_value(ds, "uo", lat, lng)
+        v = get_value(ds, "vo", lat, lng)
+        fields["current_eastward"]  = u
+        fields["current_northward"] = v
+        if u is not None and v is not None:
+            fields["current_speed"]     = math.sqrt(u**2 + v**2)
+            fields["current_direction"] = (math.degrees(math.atan2(u,v)) + 360) % 360
+        fields["currents_time"] = get_dataset_time(ds)
+    except Exception as e:
+        errors["currents"] = str(e)[:500]
+    finally:
+        if ds: ds.close()
+    return fields, errors
+
+
+def read_chlorophyll_point(lat, lng):
+    fields, errors = {}, {}
+    try:
+        history, source_status = get_chlorophyll_history_data(lat, lng, 30)
+        valid_dates = [(d,i) for d,i in history.items() if i is not None]
+        fields["chlorophyll_sources"] = source_status
+        if valid_dates:
+            latest_date, latest_item = max(valid_dates, key=lambda x: x[0])
+            fields["chlorophyll"]             = latest_item["value"]
+            fields["chlorophyll_time"]        = latest_date
+            fields["chlorophyll_source"]      = latest_item["source"]
+            fields["chlorophyll_distance_km"] = latest_item.get("distance_km")
+        else:
+            errors["chlorophyll"] = "Geçerli klorofil ölçümü bulunamadı."
+    except Exception as e:
+        errors["chlorophyll"] = str(e)[:500]
+    return fields, errors
 
 
 @app.get("/marine")
@@ -380,47 +442,19 @@ def marine(lat: float, lng: float):
         "chlorophyll": None, "chlorophyll_time": None,
         "chlorophyll_source": None, "errors": {}
     }
-    ds = None
-    try:
-        ds = get_dataset(PHYSICS_DATASET, ["mlotst","zos"], lat, lng)
-        result["mixing_layer_depth"] = get_value(ds, "mlotst", lat, lng)
-        result["sea_level"]          = get_value(ds, "zos",    lat, lng)
-        result["physics_time"]       = get_dataset_time(ds)
-    except Exception as e:
-        result["errors"]["physics"] = str(e)[:500]
-    finally:
-        if ds: ds.close()
-    read_surface_point(result, "temperature", THETAO_DATASET, "thetao", "tob", lat, lng)
-    read_surface_point(result, "salinity",    SO_DATASET,     "so",     "sob", lat, lng)
-    ds = None
-    try:
-        ds = get_dataset(CURRENTS_DATASET, ["uo","vo"], lat, lng, depth=True)
-        u = get_value(ds, "uo", lat, lng)
-        v = get_value(ds, "vo", lat, lng)
-        result["current_eastward"]  = u
-        result["current_northward"] = v
-        if u is not None and v is not None:
-            result["current_speed"]     = math.sqrt(u**2 + v**2)
-            result["current_direction"] = (math.degrees(math.atan2(u,v)) + 360) % 360
-        result["currents_time"] = get_dataset_time(ds)
-    except Exception as e:
-        result["errors"]["currents"] = str(e)[:500]
-    finally:
-        if ds: ds.close()
-    try:
-        history, source_status = get_chlorophyll_history_data(lat, lng, 30)
-        valid_dates = [(d,i) for d,i in history.items() if i is not None]
-        result["chlorophyll_sources"] = source_status
-        if valid_dates:
-            latest_date, latest_item = max(valid_dates, key=lambda x: x[0])
-            result["chlorophyll"]        = latest_item["value"]
-            result["chlorophyll_time"]   = latest_date
-            result["chlorophyll_source"] = latest_item["source"]
-            result["chlorophyll_distance_km"] = latest_item.get("distance_km")
-        else:
-            result["errors"]["chlorophyll"] = "Geçerli klorofil ölçümü bulunamadı."
-    except Exception as e:
-        result["errors"]["chlorophyll"] = str(e)[:500]
+    tasks = [
+        (read_physics_point,     (lat, lng)),
+        (read_surface_point,     ("temperature", THETAO_DATASET, "thetao", "tob", lat, lng)),
+        (read_surface_point,     ("salinity",    SO_DATASET,     "so",     "sob", lat, lng)),
+        (read_currents_point,    (lat, lng)),
+        (read_chlorophyll_point, (lat, lng)),
+    ]
+    with ThreadPoolExecutor(max_workers=MARINE_WORKERS) as pool:
+        futures = [pool.submit(fn, *args) for fn, args in tasks]
+        for future in futures:
+            fields, errors = future.result()
+            result.update(fields)
+            result["errors"].update(errors)
     result["status"] = "partial" if result["errors"] else "ok"
     with _marine_cache_lock:
         _marine_cache[cache_key] = {"created": time.time(), "data": result}
