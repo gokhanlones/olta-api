@@ -496,8 +496,12 @@ def build_habitat_response(species, region):
             "score_type":"habitat_suitability_not_probability",
             "temperature":{"minimum_modeled_range":8.4,"maximum_modeled_range":27.5,
                            "reported_mean":21.1,"unit":"C"},
-            "limitations":["Skor balığın gerçek varlığını veya yakalanma olasılığını göstermez.",
-                           "Sıcaklık modeli geçicidir.","Hücre çözünürlüğü yaklaşık 0.25 derecedir."]
+            "limitations":[
+                "Skor balığın gerçek varlığını veya yakalanma olasılığını göstermez.",
+                "Çevresel uygunluk göstergesidir, av garantisi değildir.",
+                "Sıcaklık ve tuzluluk modeli geçicidir.",
+                f"Hücre çözünürlüğü yaklaşık {HABITAT_GRID_STEP} derecedir.",
+            ]
         },
         "source_times":   source_times,
         "datasets":       dataset_status,
@@ -511,29 +515,57 @@ def build_habitat_response(species, region):
 # FIRESTORE YARDIMCI FONKSİYONLARI
 # ==================================================
 
-CHUNK_SIZE = 100  # Her chunk'ta max hücre sayısı
+CHUNK_SIZE = 500  # Her chunk'ta max hücre sayısı (~9 chunk, 42 yerine)
 
 
-def save_cells_to_firestore(doc_id, cells):
+def delete_old_chunks(ref, keep_generation_id=None):
+    """Eski generation_id'li chunk'ları sil. keep_generation_id verilen nesli koru."""
+    old   = ref.collection("chunks").stream()
+    batch = _db.batch()
+    count = 0
+    for doc in old:
+        if keep_generation_id and doc.to_dict().get("generation_id") == keep_generation_id:
+            continue  # Yeni nesli silme
+        batch.delete(doc.reference)
+        count += 1
+        if count >= 490:
+            batch.commit()
+            batch = _db.batch()
+            count = 0
+    if count > 0:
+        batch.commit()
+
+
+def save_cells_to_firestore(ref, cells, generation_id):
     """cells dizisini chunk'lara bölerek Firestore sub-collection'a yaz."""
-    ref    = _db.collection("habitat_grids").document(doc_id)
     chunks = [cells[i:i+CHUNK_SIZE] for i in range(0, len(cells), CHUNK_SIZE)]
     batch  = _db.batch()
     for idx, chunk in enumerate(chunks):
         chunk_ref = ref.collection("chunks").document(str(idx))
-        batch.set(chunk_ref, {"cells": chunk, "index": idx})
+        batch.set(chunk_ref, {
+            "cells":         chunk,
+            "index":         idx,
+            "generation_id": generation_id,
+        })
     batch.commit()
     return len(chunks)
 
 
-def load_cells_from_firestore(doc_id):
-    """Firestore sub-collection'dan tüm chunk'ları oku, cells listesini döndür."""
+def load_cells_from_firestore(doc_id, generation_id=None):
+    """Firestore sub-collection'dan tüm chunk'ları oku."""
     ref    = _db.collection("habitat_grids").document(doc_id)
     chunks = ref.collection("chunks").order_by("index").stream()
     cells  = []
     for chunk in chunks:
-        cells.extend(chunk.to_dict().get("cells", []))
+        d = chunk.to_dict()
+        # Generation ID kontrolü — eski chunk'ları atla
+        if generation_id and d.get("generation_id") != generation_id:
+            continue
+        cells.extend(d.get("cells", []))
     return cells
+
+
+
 
 # ==================================================
 # HABITAT GRID API
@@ -564,8 +596,9 @@ def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: boo
         try:
             snap = _db.collection("habitat_grids").document(doc_id).get()
             if snap.exists:
-                data  = snap.to_dict()
-                cells = load_cells_from_firestore(doc_id)
+                data          = snap.to_dict()
+                generation_id = data.get("generation_id")
+                cells         = load_cells_from_firestore(doc_id, generation_id)
                 if cells:
                     data["cells"]  = cells
                     data["cached"] = True
@@ -591,16 +624,21 @@ def save_grid(species: str = "bluefish", region: str = "turkey", secret: str = "
     if not _db:
         raise HTTPException(status_code=500, detail="Firebase bağlı değil")
 
-    data   = build_habitat_response(species, region)
-    doc_id = f"{species}_{region}"
-    ref    = _db.collection("habitat_grids").document(doc_id)
+    data          = build_habitat_response(species, region)
+    doc_id        = f"{species}_{region}"
+    generation_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    ref           = _db.collection("habitat_grids").document(doc_id)
 
-    # Metadata'yı ana belgeye kaydet (cells hariç)
+    # 1. Yeni chunk'ları yaz (generation_id ile işaretli)
+    num_chunks = save_cells_to_firestore(ref, data["cells"], generation_id)
+
+    # 2. Metadata'yı en son güncelle (chunk'lar hazır olduktan sonra)
     metadata = {k: v for k, v in data.items() if k != "cells"}
+    metadata["generation_id"] = generation_id
     ref.set(metadata)
 
-    # cells'i chunk'lara bölerek sub-collection'a kaydet
-    num_chunks = save_cells_to_firestore(doc_id, data["cells"])
+    # 3. Eski nesil chunk'ları temizle (yeni nesli koru)
+    delete_old_chunks(ref, keep_generation_id=generation_id)
 
     return {
         "ok":           True,
