@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
+
+import feed
 import copernicusmarine
 import firebase_admin
 from firebase_admin import credentials, firestore as fs
@@ -20,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="3.9")
+app = FastAPI(title="OLTA Marine API", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -327,7 +329,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "3.9"
+        "version":  "4.0"
     }
 
 # ==================================================
@@ -858,6 +860,80 @@ def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: boo
     return response
 
 # ==================================================
+# ANA SAYFA AKIŞI: günlük "en uygun kıyılar" gönderileri
+# ==================================================
+
+TURKEY_TZ = timezone(timedelta(hours=3))
+
+
+def _fish_score(temperature, salinity, fish):
+    params = {
+        "sstMin": float(fish["sstMin"]), "sstMax": float(fish["sstMax"]),
+        "sssMin": float(fish["sssMin"]) if fish.get("sssMin") is not None else None,
+        "sssMax": float(fish["sssMax"]) if fish.get("sssMax") is not None else None,
+    }
+    return habitat_score(temperature, salinity, params)
+
+
+def generate_and_store_posts(cells, force=False):
+    """Bugünün gönderilerini üret ve feed_posts koleksiyonuna yaz (günde bir kez)."""
+    if _db is None:
+        return {"ok": False, "error": "Firebase bağlı değil"}
+    today    = datetime.now(TURKEY_TZ).date()
+    date_str = today.strftime("%Y-%m-%d")
+    posts_ref = _db.collection("feed_posts")
+
+    existing = list(posts_ref.where("date", "==", date_str).limit(1).stream())
+    if existing and not force:
+        return {"ok": True, "skipped": "bugünün gönderileri zaten var", "date": date_str}
+
+    fish_list = []
+    for doc in _db.collection("fish").stream():
+        d = doc.to_dict()
+        if d.get("name"):
+            fish_list.append(d)
+
+    last_posted = {}
+    recent = posts_ref.order_by("createdAt", direction=fs.Query.DESCENDING).limit(80).stream()
+    for doc in recent:
+        d = doc.to_dict()
+        if d.get("species") and d["species"] not in last_posted:
+            last_posted[d["species"]] = d.get("date", "")
+
+    posts, coastal_count = feed.build_daily_posts(
+        cells, fish_list, last_posted, today, _fish_score, range_score)
+
+    batch = _db.batch()
+    for i, post in enumerate(posts):
+        doc = {k: v for k, v in post.items() if k != "id"}
+        doc["createdAt"] = fs.SERVER_TIMESTAMP
+        doc["order"] = i
+        batch.set(posts_ref.document(post["id"]), doc)
+    if posts:
+        batch.commit()
+    return {"ok": True, "date": date_str, "posts": [p["species"] for p in posts],
+            "coastal_cells": coastal_count}
+
+
+@app.get("/generate-posts")
+def generate_posts(force: bool = False, secret: str = "",
+                   x_cron_secret: Optional[str] = Header(default=None)):
+    """Elle tetikleme / test için. Normalde /save-grid sonunda otomatik çalışır."""
+    if not CRON_SECRET:
+        raise HTTPException(status_code=503, detail="CRON_SECRET tanımlı değil")
+    if not is_authorized(x_cron_secret or secret):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    cached = get_habitat_cache("bluefish:turkey")
+    cells = cached["cells"] if cached else None
+    if not cells and _db:
+        snap = _db.collection("habitat_grids").document("bluefish_turkey").get()
+        if snap.exists:
+            cells = load_cells_from_firestore("bluefish_turkey", snap.to_dict().get("generation_id"))
+    if not cells:
+        raise HTTPException(status_code=503, detail="Grid bulunamadı; önce /save-grid çalıştırın")
+    return generate_and_store_posts(cells, force=force)
+
+# ==================================================
 # SAVE GRID → Firestore (cron tarafından çağrılır)
 # ==================================================
 
@@ -890,6 +966,12 @@ def save_grid(species: str = "bluefish", region: str = "turkey", secret: str = "
     # 3. Eski nesil chunk'ları temizle (yeni nesli koru)
     delete_old_chunks(ref, keep_generation_id=generation_id)
 
+    # 4. Ana sayfa akışı (günde bir kez; hata grid kaydını bozmasın)
+    try:
+        posts_result = generate_and_store_posts(data["cells"])
+    except Exception as e:
+        posts_result = {"ok": False, "error": str(e)[:300]}
+
     return {
         "ok":           True,
         "saved_cells":  len(data["cells"]),
@@ -897,4 +979,5 @@ def save_grid(species: str = "bluefish", region: str = "turkey", secret: str = "
         "generated_at": data["generated_at"],
         "species":      species,
         "region":       region,
+        "feed":         posts_result,
     }
