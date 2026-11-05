@@ -1,8 +1,9 @@
-fastapi
-uvicorn
-copernicusmarine
-requests
-numpy
-xarray
-firebase-admin
-scipy
+# Render'daki son başarılı build'de (2026-11-05, Python 3.14) kurulu sürümler
+fastapi==0.162.0
+uvicorn==0.54.0
+copernicusmarine==2.5.1
+requests==2.34.2
+numpy==2.5.4
+xarray==2026.9.0
+firebase-admin==7.7.0
+scipy==1.18.1

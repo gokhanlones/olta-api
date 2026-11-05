@@ -4,6 +4,7 @@ import json
 import math
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -19,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="3.7")
+app = FastAPI(title="OLTA Marine API", version="3.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -326,7 +327,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "3.7"
+        "version":  "3.9"
     }
 
 # ==================================================
@@ -338,29 +339,90 @@ _marine_cache      = {}
 _marine_cache_lock = threading.Lock()
 
 
-def read_surface_point(result, key, dataset_id, variable, fallback_variable, lat, lng):
+MARINE_WORKERS = 5   # /marine'daki bağımsız veri seti okumaları paralel çalışır
+
+
+# Her okuyucu (alanlar, hatalar) döndürür; ortak sözlüğe dokunmaz (thread güvenli).
+
+def read_physics_point(lat, lng):
+    fields, errors = {}, {}
+    ds = None
+    try:
+        ds = get_dataset(PHYSICS_DATASET, ["mlotst","zos"], lat, lng)
+        fields["mixing_layer_depth"] = get_value(ds, "mlotst", lat, lng)
+        fields["sea_level"]          = get_value(ds, "zos",    lat, lng)
+        fields["physics_time"]       = get_dataset_time(ds)
+    except Exception as e:
+        errors["physics"] = str(e)[:500]
+    finally:
+        if ds: ds.close()
+    return fields, errors
+
+
+def read_surface_point(key, dataset_id, variable, fallback_variable, lat, lng):
     """Yüzey değerini oku; set açılamazsa 2D fizik setindeki dip değerine düş."""
+    fields, errors = {}, {}
     ds = None
     try:
         ds = get_dataset(dataset_id, [variable], lat, lng, depth=True)
-        result[key] = get_value(ds, variable, lat, lng)
-        result[f"{key}_source"] = "surface"
-        result[f"{key}_time"]   = get_dataset_time(ds)
-        return
+        fields[key] = get_value(ds, variable, lat, lng)
+        fields[f"{key}_source"] = "surface"
+        fields[f"{key}_time"]   = get_dataset_time(ds)
+        return fields, errors
     except Exception as e:
-        result["errors"][key] = str(e)[:500]
+        errors[key] = str(e)[:500]
     finally:
         if ds: ds.close()
     ds = None
     try:
         ds = get_dataset(PHYSICS_DATASET, [fallback_variable], lat, lng)
-        result[key] = get_value(ds, fallback_variable, lat, lng)
-        result[f"{key}_source"] = "bottom_fallback"
-        result[f"{key}_time"]   = get_dataset_time(ds)
+        fields[key] = get_value(ds, fallback_variable, lat, lng)
+        fields[f"{key}_source"] = "bottom_fallback"
+        fields[f"{key}_time"]   = get_dataset_time(ds)
     except Exception as e:
-        result["errors"][f"{key}_fallback"] = str(e)[:500]
+        errors[f"{key}_fallback"] = str(e)[:500]
     finally:
         if ds: ds.close()
+    return fields, errors
+
+
+def read_currents_point(lat, lng):
+    fields, errors = {}, {}
+    ds = None
+    try:
+        ds = get_dataset(CURRENTS_DATASET, ["uo","vo"], lat, lng, depth=True)
+        u = get_value(ds, "uo", lat, lng)
+        v = get_value(ds, "vo", lat, lng)
+        fields["current_eastward"]  = u
+        fields["current_northward"] = v
+        if u is not None and v is not None:
+            fields["current_speed"]     = math.sqrt(u**2 + v**2)
+            fields["current_direction"] = (math.degrees(math.atan2(u,v)) + 360) % 360
+        fields["currents_time"] = get_dataset_time(ds)
+    except Exception as e:
+        errors["currents"] = str(e)[:500]
+    finally:
+        if ds: ds.close()
+    return fields, errors
+
+
+def read_chlorophyll_point(lat, lng):
+    fields, errors = {}, {}
+    try:
+        history, source_status = get_chlorophyll_history_data(lat, lng, 30)
+        valid_dates = [(d,i) for d,i in history.items() if i is not None]
+        fields["chlorophyll_sources"] = source_status
+        if valid_dates:
+            latest_date, latest_item = max(valid_dates, key=lambda x: x[0])
+            fields["chlorophyll"]             = latest_item["value"]
+            fields["chlorophyll_time"]        = latest_date
+            fields["chlorophyll_source"]      = latest_item["source"]
+            fields["chlorophyll_distance_km"] = latest_item.get("distance_km")
+        else:
+            errors["chlorophyll"] = "Geçerli klorofil ölçümü bulunamadı."
+    except Exception as e:
+        errors["chlorophyll"] = str(e)[:500]
+    return fields, errors
 
 
 @app.get("/marine")
@@ -380,47 +442,19 @@ def marine(lat: float, lng: float):
         "chlorophyll": None, "chlorophyll_time": None,
         "chlorophyll_source": None, "errors": {}
     }
-    ds = None
-    try:
-        ds = get_dataset(PHYSICS_DATASET, ["mlotst","zos"], lat, lng)
-        result["mixing_layer_depth"] = get_value(ds, "mlotst", lat, lng)
-        result["sea_level"]          = get_value(ds, "zos",    lat, lng)
-        result["physics_time"]       = get_dataset_time(ds)
-    except Exception as e:
-        result["errors"]["physics"] = str(e)[:500]
-    finally:
-        if ds: ds.close()
-    read_surface_point(result, "temperature", THETAO_DATASET, "thetao", "tob", lat, lng)
-    read_surface_point(result, "salinity",    SO_DATASET,     "so",     "sob", lat, lng)
-    ds = None
-    try:
-        ds = get_dataset(CURRENTS_DATASET, ["uo","vo"], lat, lng, depth=True)
-        u = get_value(ds, "uo", lat, lng)
-        v = get_value(ds, "vo", lat, lng)
-        result["current_eastward"]  = u
-        result["current_northward"] = v
-        if u is not None and v is not None:
-            result["current_speed"]     = math.sqrt(u**2 + v**2)
-            result["current_direction"] = (math.degrees(math.atan2(u,v)) + 360) % 360
-        result["currents_time"] = get_dataset_time(ds)
-    except Exception as e:
-        result["errors"]["currents"] = str(e)[:500]
-    finally:
-        if ds: ds.close()
-    try:
-        history, source_status = get_chlorophyll_history_data(lat, lng, 30)
-        valid_dates = [(d,i) for d,i in history.items() if i is not None]
-        result["chlorophyll_sources"] = source_status
-        if valid_dates:
-            latest_date, latest_item = max(valid_dates, key=lambda x: x[0])
-            result["chlorophyll"]        = latest_item["value"]
-            result["chlorophyll_time"]   = latest_date
-            result["chlorophyll_source"] = latest_item["source"]
-            result["chlorophyll_distance_km"] = latest_item.get("distance_km")
-        else:
-            result["errors"]["chlorophyll"] = "Geçerli klorofil ölçümü bulunamadı."
-    except Exception as e:
-        result["errors"]["chlorophyll"] = str(e)[:500]
+    tasks = [
+        (read_physics_point,     (lat, lng)),
+        (read_surface_point,     ("temperature", THETAO_DATASET, "thetao", "tob", lat, lng)),
+        (read_surface_point,     ("salinity",    SO_DATASET,     "so",     "sob", lat, lng)),
+        (read_currents_point,    (lat, lng)),
+        (read_chlorophyll_point, (lat, lng)),
+    ]
+    with ThreadPoolExecutor(max_workers=MARINE_WORKERS) as pool:
+        futures = [pool.submit(fn, *args) for fn, args in tasks]
+        for future in futures:
+            fields, errors = future.result()
+            result.update(fields)
+            result["errors"].update(errors)
     result["status"] = "partial" if result["errors"] else "ok"
     with _marine_cache_lock:
         _marine_cache[cache_key] = {"created": time.time(), "data": result}
@@ -499,15 +533,70 @@ def regional_data_to_grid(ds, variable, target_latitudes, target_longitudes):
     return values
 
 
-def bluefish_temperature_score(temperature):
-    if temperature is None or not math.isfinite(temperature): return None
-    minimum, maximum, center = 8.4, 27.5, 21.1
-    if temperature < minimum or temperature > maximum: return 0.0
-    if temperature <= center:
-        score = (temperature - minimum) / (center - minimum) * 100
-    else:
-        score = (maximum - temperature) / (maximum - center) * 100
-    return round(max(0.0, min(100.0, score)), 1)
+# ---- UYGUNLUK SKORU ------------------------------------------------------
+# Ön yüzdeki (forecast.html) scoreFishCell ile BİREBİR aynı formül:
+#   aralık skoru = merkezde 100, sınırlarda 0 (üçgen), aralık dışı 0
+#   skor = sıcaklık %70 + tuzluluk %30 (tuzluluk aralığı/verisi yoksa yalnızca sıcaklık)
+# Tür aralıkları ön yüzün de okuduğu Firestore `fish` koleksiyonundan gelir.
+
+SCORE_WEIGHTS = {"temperature": 0.7, "salinity": 0.3}
+SPECIES_DEFAULTS = {
+    # Firestore okunamazsa kullanılacak yedek aralıklar
+    "bluefish": {"name": "Lüfer", "sstMin": 8.4, "sstMax": 27.5, "sssMin": None, "sssMax": None},
+}
+SPECIES_PARAMS_TTL = 6 * 60 * 60
+_species_params_cache = {}
+
+
+def get_species_params(species):
+    """Türün sıcaklık/tuzluluk aralıklarını Firestore'dan oku (6 saat önbellek)."""
+    default = SPECIES_DEFAULTS[species]
+    cached = _species_params_cache.get(species)
+    if cached and time.time() - cached["created"] < SPECIES_PARAMS_TTL:
+        return cached["params"]
+    params = {**default, "source": "default"}
+    if _db is not None:
+        try:
+            docs = _db.collection("fish").where("name", "==", default["name"]).limit(1).stream()
+            for doc in docs:
+                d = doc.to_dict()
+                if d.get("sstMin") is not None and d.get("sstMax") is not None:
+                    params = {
+                        "name":   default["name"],
+                        "sstMin": float(d["sstMin"]), "sstMax": float(d["sstMax"]),
+                        "sssMin": float(d["sssMin"]) if d.get("sssMin") is not None else None,
+                        "sssMax": float(d["sssMax"]) if d.get("sssMax") is not None else None,
+                        "source": "firestore",
+                    }
+        except Exception as e:
+            print(f"Tür parametreleri okunamadı: {e}")
+    _species_params_cache[species] = {"created": time.time(), "params": params}
+    return params
+
+
+def range_score(value, minimum, maximum):
+    if value is None or minimum is None or maximum is None or maximum <= minimum:
+        return None
+    if value < minimum or value > maximum:
+        return 0.0
+    center     = (minimum + maximum) / 2
+    half_range = (maximum - minimum) / 2
+    return max(0.0, (1 - abs(value - center) / half_range) * 100)
+
+
+def js_round(x):
+    """JavaScript Math.round ile aynı (Python round() yarımları çifte yuvarlar)."""
+    return int(math.floor(x + 0.5))
+
+
+def habitat_score(temperature, salinity, params):
+    sst = range_score(temperature, params["sstMin"], params["sstMax"])
+    if sst is None:
+        return None
+    sss = range_score(salinity, params["sssMin"], params["sssMax"])
+    if sss is not None:
+        return js_round(sst * SCORE_WEIGHTS["temperature"] + sss * SCORE_WEIGHTS["salinity"])
+    return js_round(sst)
 
 
 def get_habitat_level(score):
@@ -531,7 +620,8 @@ def build_habitat_response(species, region):
     longitudes = np.round(np.arange(HABITAT_REGION["min_lng"],
                                     HABITAT_REGION["max_lng"] + 0.001,
                                     HABITAT_GRID_STEP), 4)
-    arrays         = {"temperature":None,"salinity":None,"oxygen":None,"chlorophyll":None}
+    arrays         = {"temperature":None,"salinity":None,"oxygen":None,"chlorophyll":None,
+                      "current_u":None,"current_v":None}
     source_times   = {}
     dataset_status = {}
     errors         = {}
@@ -564,6 +654,22 @@ def build_habitat_response(species, region):
         elif attempt_errors:
             errors[f"{key}_primary"] = " | ".join(attempt_errors)[:1000]
 
+    # Akıntı (u: doğuya, v: kuzeye; m/s) — tek sette iki bileşen
+    ds = None
+    try:
+        ds = get_regional_dataset(CURRENTS_DATASET, ["uo", "vo"], depth=True)
+        arrays["current_u"]        = regional_data_to_grid(ds, "uo", latitudes, longitudes)
+        arrays["current_v"]        = regional_data_to_grid(ds, "vo", latitudes, longitudes)
+        source_times["currents"]   = get_dataset_time(ds)
+        dataset_status["currents"] = {"ok": True, "dataset_id": CURRENTS_DATASET}
+    except Exception as e:
+        errors["currents"]         = str(e)[:500]
+        dataset_status["currents"] = {"ok": False, "error": errors["currents"]}
+    finally:
+        if ds: ds.close()
+
+    params = get_species_params(species)
+
     cells        = []
     total_cells  = 0
     scored_cells = 0
@@ -575,10 +681,12 @@ def build_habitat_response(species, region):
             salinity    = safe_grid_value(arrays["salinity"],    i, j)
             oxygen      = safe_grid_value(arrays["oxygen"],      i, j)
             chlorophyll = safe_grid_value(arrays["chlorophyll"], i, j)
+            current_u   = safe_grid_value(arrays["current_u"],   i, j)
+            current_v   = safe_grid_value(arrays["current_v"],   i, j)
             if temperature is None and salinity is None:
                 continue
             total_cells += 1
-            score        = bluefish_temperature_score(temperature)
+            score        = habitat_score(temperature, salinity, params)
             completeness = round(sum(v is not None for v in (temperature,salinity,oxygen)) / 3 * 100)
             if score is not None: scored_cells += 1
             cells.append({
@@ -592,6 +700,8 @@ def build_habitat_response(species, region):
                 "oxygen":      round(oxygen,3)      if oxygen      is not None else None,
                 "oxygen_mg_l": round(oxygen*0.032,3)if oxygen      is not None else None,
                 "chlorophyll": round(chlorophyll,3) if chlorophyll is not None else None,
+                "current_u":   round(current_u,3)   if current_u   is not None else None,
+                "current_v":   round(current_v,3)   if current_v   is not None else None,
                 "score": score,
                 "level": get_habitat_level(score),
                 "data_completeness": completeness,
@@ -608,10 +718,13 @@ def build_habitat_response(species, region):
         "grid": {"step_degrees":HABITAT_GRID_STEP,"latitude_count":len(latitudes),
                  "longitude_count":len(longitudes),"total_cells":total_cells,"scored_cells":scored_cells},
         "model": {
-            "version":"0.2","type":"provisional_temperature_suitability",
+            "version":"0.3","type":"temperature_salinity_range_suitability",
             "score_type":"habitat_suitability_not_probability",
-            "temperature":{"minimum_modeled_range":8.4,"maximum_modeled_range":27.5,
-                           "reported_mean":21.1,"unit":"C"},
+            "formula":"temperature_range_score*0.7 + salinity_range_score*0.3 (tuzluluk yoksa yalnızca sıcaklık)",
+            "weights": SCORE_WEIGHTS,
+            "temperature":{"min":params["sstMin"],"max":params["sstMax"],"unit":"C"},
+            "salinity":{"min":params["sssMin"],"max":params["sssMax"],"unit":"PSU"},
+            "parameters_source": params["source"],
             "limitations":[
                 "Skor balığın gerçek varlığını veya yakalanma olasılığını göstermez.",
                 "Çevresel uygunluk göstergesidir, av garantisi değildir.",
