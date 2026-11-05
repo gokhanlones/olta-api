@@ -1,23 +1,25 @@
 import os
+import hmac
 import json
 import math
 import time
 import threading
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import numpy as np
 import copernicusmarine
 import firebase_admin
 from firebase_admin import credentials, firestore as fs
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 # ==================================================
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="3.5")
+app = FastAPI(title="OLTA Marine API", version="3.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,7 +43,14 @@ if _fb_key and not firebase_admin._apps:
     except Exception as _e:
         print(f"Firebase init error: {_e}")
 
-CRON_SECRET = os.environ.get("CRON_SECRET", "olta2024")
+# Varsayılan yok: tanımlı değilse korumalı uç noktalar kapalıdır.
+CRON_SECRET = os.environ.get("CRON_SECRET") or None
+
+
+def is_authorized(secret_value):
+    if not CRON_SECRET or not secret_value:
+        return False
+    return hmac.compare_digest(str(secret_value), CRON_SECRET)
 
 # ==================================================
 # COPERNICUS CREDENTIALS
@@ -54,11 +63,16 @@ CMEMS_PASS = os.environ.get("CMEMS_PASSWORD")
 # DATASET IDS
 # ==================================================
 
+# Yüzey sıcaklığı / tuzluluğu (3D, depth=0 ≈ 0.5 m)
+THETAO_DATASET   = "cmems_mod_glo_phy-thetao_anfc_0.083deg_P1D-m"
+SO_DATASET       = "cmems_mod_glo_phy-so_anfc_0.083deg_P1D-m"
+# 2D fizik: tob/sob = DİP sıcaklığı/tuzluluğu, mlotst, zos
 PHYSICS_DATASET  = "cmems_mod_glo_phy_anfc_0.083deg_P1D-m"
 CURRENTS_DATASET = "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
 
 CHL_BLACKSEA_NRT     = "cmems_obs-oc_blk_bgc-plankton_nrt_l4-gapfree-multi-1km_P1D"
 CHL_BLACKSEA_HISTORY = "cmems_obs-oc_blk_bgc-plankton_my_l4-gapfree-multi-1km_P1D"
+CHL_GLOBAL_NRT       = "cmems_obs-oc_glo_bgc-plankton_nrt_l4-gapfree-multi-4km_P1D"
 CHL_GLOBAL           = "cmems_obs-oc_glo_bgc-plankton_my_l4-gapfree-multi-4km_P1D"
 
 BGC_BIO_DATASET      = "cmems_mod_glo_bgc-bio_anfc_0.25deg_P1D-m"
@@ -69,7 +83,8 @@ BGC_PLANKTON_DATASET = "cmems_mod_glo_bgc-plankton_anfc_0.25deg_P1D-m"
 CHL_SOURCES = [
     {"name": "blacksea_nrt_1km",     "id": CHL_BLACKSEA_NRT,     "regional": True},
     {"name": "blacksea_history_1km", "id": CHL_BLACKSEA_HISTORY,  "regional": True},
-    {"name": "global_4km",           "id": CHL_GLOBAL,            "regional": False},
+    {"name": "global_nrt_4km",       "id": CHL_GLOBAL_NRT,        "regional": False},
+    {"name": "global_history_4km",   "id": CHL_GLOBAL,            "regional": False},
 ]
 
 # ==================================================
@@ -81,6 +96,26 @@ def validate_coordinates(lat, lng):
         raise HTTPException(status_code=400, detail="Geçersiz enlem")
     if not (-180 <= lng <= 180):
         raise HTTPException(status_code=400, detail="Geçersiz boylam")
+
+
+def utc_now_naive():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def default_time_window():
+    """Analiz/tahmin setlerinde bugünü kapsayan dar pencere (indirmeyi küçültür)."""
+    now = utc_now_naive()
+    return ((now - timedelta(days=2)).strftime("%Y-%m-%dT00:00:00"),
+            (now + timedelta(days=1)).strftime("%Y-%m-%dT23:59:59"))
+
+
+def select_current_time(data):
+    """'anfc' setlerinin son adımı ~10 gün sonrası tahmindir; bugüne en yakın adımı seç."""
+    if "time" in data.dims:
+        # Günlük ortalamalar 00:00 damgalı: öğleden sonra "en yakın" yarın olmasın diye günün başı
+        today = utc_now_naive().replace(hour=0, minute=0, second=0, microsecond=0)
+        data = data.sortby("time").sel(time=np.datetime64(today), method="nearest")
+    return data
 
 
 def get_dataset(dataset_id, variables, lat, lng, depth=False,
@@ -100,6 +135,8 @@ def get_dataset(dataset_id, variables, lat, lng, depth=False,
     if depth:
         params["minimum_depth"] = 0
         params["maximum_depth"] = 5
+    if not start_date and not end_date:
+        start_date, end_date = default_time_window()
     if start_date:
         params["start_datetime"] = start_date
     if end_date:
@@ -115,8 +152,8 @@ def get_value(ds, variable, lat, lng):
     lng_name = next((n for n in ["longitude","lon"] if n in data.dims), None)
     if lat_name: data = data.sel({lat_name: lat}, method="nearest")
     if lng_name: data = data.sel({lng_name: lng}, method="nearest")
-    if "time"  in data.dims: data = data.isel(time=-1)
-    if "depth" in data.dims: data = data.isel(depth=0)
+    data = select_current_time(data)
+    if "depth" in data.dims: data = data.sortby("depth").isel(depth=0)
     value = float(np.asarray(data.compute().values).squeeze())
     return None if not math.isfinite(value) else value
 
@@ -125,7 +162,7 @@ def get_dataset_time(ds):
     if "time" not in ds.coords:
         return None
     try:
-        return str(ds["time"].values[-1])
+        return str(select_current_time(ds["time"]).values)
     except Exception:
         return None
 
@@ -255,16 +292,51 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "3.5"
+        "version":  "3.6"
     }
 
 # ==================================================
 # MARINE API
 # ==================================================
 
+MARINE_CACHE_TTL = 60 * 60
+_marine_cache      = {}
+_marine_cache_lock = threading.Lock()
+
+
+def read_surface_point(result, key, dataset_id, variable, fallback_variable, lat, lng):
+    """Yüzey değerini oku; set açılamazsa 2D fizik setindeki dip değerine düş."""
+    ds = None
+    try:
+        ds = get_dataset(dataset_id, [variable], lat, lng, depth=True)
+        result[key] = get_value(ds, variable, lat, lng)
+        result[f"{key}_source"] = "surface"
+        result[f"{key}_time"]   = get_dataset_time(ds)
+        return
+    except Exception as e:
+        result["errors"][key] = str(e)[:500]
+    finally:
+        if ds: ds.close()
+    ds = None
+    try:
+        ds = get_dataset(PHYSICS_DATASET, [fallback_variable], lat, lng)
+        result[key] = get_value(ds, fallback_variable, lat, lng)
+        result[f"{key}_source"] = "bottom_fallback"
+        result[f"{key}_time"]   = get_dataset_time(ds)
+    except Exception as e:
+        result["errors"][f"{key}_fallback"] = str(e)[:500]
+    finally:
+        if ds: ds.close()
+
+
 @app.get("/marine")
 def marine(lat: float, lng: float):
     validate_coordinates(lat, lng)
+    cache_key = (round(lat / 0.05) * 0.05, round(lng / 0.05) * 0.05)
+    with _marine_cache_lock:
+        item = _marine_cache.get(cache_key)
+        if item and time.time() - item["created"] < MARINE_CACHE_TTL:
+            return {**item["data"], "lat": lat, "lng": lng, "cached": True}
     result = {
         "ok": True, "lat": lat, "lng": lng,
         "temperature": None, "salinity": None,
@@ -276,9 +348,7 @@ def marine(lat: float, lng: float):
     }
     ds = None
     try:
-        ds = get_dataset(PHYSICS_DATASET, ["tob","sob","mlotst","zos"], lat, lng)
-        result["temperature"]        = get_value(ds, "tob",    lat, lng)
-        result["salinity"]           = get_value(ds, "sob",    lat, lng)
+        ds = get_dataset(PHYSICS_DATASET, ["mlotst","zos"], lat, lng)
         result["mixing_layer_depth"] = get_value(ds, "mlotst", lat, lng)
         result["sea_level"]          = get_value(ds, "zos",    lat, lng)
         result["physics_time"]       = get_dataset_time(ds)
@@ -286,6 +356,8 @@ def marine(lat: float, lng: float):
         result["errors"]["physics"] = str(e)[:500]
     finally:
         if ds: ds.close()
+    read_surface_point(result, "temperature", THETAO_DATASET, "thetao", "tob", lat, lng)
+    read_surface_point(result, "salinity",    SO_DATASET,     "so",     "sob", lat, lng)
     ds = None
     try:
         ds = get_dataset(CURRENTS_DATASET, ["uo","vo"], lat, lng, depth=True)
@@ -315,6 +387,8 @@ def marine(lat: float, lng: float):
     except Exception as e:
         result["errors"]["chlorophyll"] = str(e)[:500]
     result["status"] = "partial" if result["errors"] else "ok"
+    with _marine_cache_lock:
+        _marine_cache[cache_key] = {"created": time.time(), "data": result}
     return result
 
 # ==================================================
@@ -364,6 +438,7 @@ def get_regional_dataset(dataset_id, variables, depth=False):
     if depth:
         params["minimum_depth"] = 0
         params["maximum_depth"] = 5
+    params["start_datetime"], params["end_datetime"] = default_time_window()
     return copernicusmarine.open_dataset(**params)
 
 
@@ -375,7 +450,7 @@ def regional_data_to_grid(ds, variable, target_latitudes, target_longitudes):
     if not lat_name or not lng_name:
         raise Exception("Enlem/boylam koordinatları bulunamadı.")
     data = ds[variable]
-    if "time"  in data.dims: data = data.sortby("time").isel(time=-1)
+    data = select_current_time(data)
     if "depth" in data.dims: data = data.sortby("depth").isel(depth=0)
     data = data.squeeze(drop=True).sortby(lat_name).sortby(lng_name)
     interpolated = data.interp(
@@ -426,27 +501,33 @@ def build_habitat_response(species, region):
     dataset_status = {}
     errors         = {}
 
-    for ds_id, vars_, depth_, key_temp, key_sal_or_var in [
-        (PHYSICS_DATASET, ["tob","sob"], False, "tob", "sob"),
-        (BGC_BIO_DATASET, ["o2"],        True,  "o2",  None),
-        (BGC_PFT_DATASET, ["chl"],       True,  "chl", None),
-    ]:
-        ds = None
-        try:
-            ds = get_regional_dataset(ds_id, vars_, depth=depth_)
-            k_map = {"tob":"temperature","o2":"oxygen","chl":"chlorophyll"}
-            arrays[k_map[key_temp]] = regional_data_to_grid(ds, key_temp, latitudes, longitudes)
-            if key_sal_or_var:
-                arrays["salinity"] = regional_data_to_grid(ds, key_sal_or_var, latitudes, longitudes)
-            t_map = {"tob":"physics","o2":"oxygen","chl":"chlorophyll"}
-            source_times[t_map[key_temp]]   = get_dataset_time(ds)
-            dataset_status[t_map[key_temp]] = {"ok":True,"dataset_id":ds_id}
-        except Exception as e:
-            k = {"tob":"physics","o2":"oxygen","chl":"chlorophyll"}[key_temp]
-            errors[k]         = str(e)[:500]
-            dataset_status[k] = {"ok":False,"error":str(e)[:500]}
-        finally:
-            if ds: ds.close()
+    # (çıktı anahtarı, [(dataset, değişken, depth), yedekler...])
+    layer_specs = [
+        ("temperature", [(THETAO_DATASET, "thetao", True), (PHYSICS_DATASET, "tob", False)]),
+        ("salinity",    [(SO_DATASET,     "so",     True), (PHYSICS_DATASET, "sob", False)]),
+        ("oxygen",      [(BGC_BIO_DATASET, "o2",    True)]),
+        ("chlorophyll", [(BGC_PFT_DATASET, "chl",   True)]),
+    ]
+    for key, candidates in layer_specs:
+        attempt_errors = []
+        for ds_id, var, depth_ in candidates:
+            ds = None
+            try:
+                ds = get_regional_dataset(ds_id, [var], depth=depth_)
+                arrays[key]         = regional_data_to_grid(ds, var, latitudes, longitudes)
+                source_times[key]   = get_dataset_time(ds)
+                dataset_status[key] = {"ok": True, "dataset_id": ds_id, "variable": var,
+                                       "fallback": var in ("tob", "sob")}
+                break
+            except Exception as e:
+                attempt_errors.append(f"{ds_id}/{var}: {str(e)[:300]}")
+            finally:
+                if ds: ds.close()
+        if arrays[key] is None:
+            errors[key]         = " | ".join(attempt_errors)[:1000]
+            dataset_status[key] = {"ok": False, "error": errors[key]}
+        elif attempt_errors:
+            errors[f"{key}_primary"] = " | ".join(attempt_errors)[:1000]
 
     cells        = []
     total_cells  = 0
@@ -492,7 +573,7 @@ def build_habitat_response(species, region):
         "grid": {"step_degrees":HABITAT_GRID_STEP,"latitude_count":len(latitudes),
                  "longitude_count":len(longitudes),"total_cells":total_cells,"scored_cells":scored_cells},
         "model": {
-            "version":"0.1","type":"provisional_temperature_suitability",
+            "version":"0.2","type":"provisional_temperature_suitability",
             "score_type":"habitat_suitability_not_probability",
             "temperature":{"minimum_modeled_range":8.4,"maximum_modeled_range":27.5,
                            "reported_mean":21.1,"unit":"C"},
@@ -500,6 +581,7 @@ def build_habitat_response(species, region):
                 "Skor balığın gerçek varlığını veya yakalanma olasılığını göstermez.",
                 "Çevresel uygunluk göstergesidir, av garantisi değildir.",
                 "Sıcaklık ve tuzluluk modeli geçicidir.",
+                "Değerler yüzeye en yakın model katmanından (~0.5 m), bugüne en yakın günden alınır.",
                 f"Hücre çözünürlüğü yaklaşık {HABITAT_GRID_STEP} derecedir.",
             ]
         },
@@ -541,7 +623,8 @@ def save_cells_to_firestore(ref, cells, generation_id):
     chunks = [cells[i:i+CHUNK_SIZE] for i in range(0, len(cells), CHUNK_SIZE)]
     batch  = _db.batch()
     for idx, chunk in enumerate(chunks):
-        chunk_ref = ref.collection("chunks").document(str(idx))
+        # Nesle özel ID: yeni yazım eski nesli ezmez, okuyucular tutarlı kalır.
+        chunk_ref = ref.collection("chunks").document(f"{generation_id}_{idx:03d}")
         batch.set(chunk_ref, {
             "cells":         chunk,
             "index":         idx,
@@ -571,8 +654,12 @@ def load_cells_from_firestore(doc_id, generation_id=None):
 # HABITAT GRID API
 # ==================================================
 
+_habitat_build_lock = threading.Lock()
+
+
 @app.get("/habitat-grid")
-def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: bool = False):
+def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: bool = False,
+                 x_cron_secret: Optional[str] = Header(default=None)):
     species = species.lower().strip()
     region  = region.lower().strip()
     if species != "bluefish":
@@ -582,6 +669,10 @@ def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: boo
 
     cache_key = f"{species}:{region}"
     doc_id    = f"{species}_{region}"
+
+    # refresh pahalı CMEMS hesabını tetikler; yalnızca yetkili çağrılara izin ver
+    if refresh and not is_authorized(x_cron_secret):
+        refresh = False
 
     # 1. Bellek cache
     if not refresh:
@@ -608,9 +699,14 @@ def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: boo
         except Exception as e:
             print(f"Firestore read error: {e}")
 
-    # 3. CMEMS'ten hesapla
-    response = build_habitat_response(species, region)
-    set_habitat_cache(cache_key, response)
+    # 3. CMEMS'ten hesapla — aynı anda tek hesaplama
+    with _habitat_build_lock:
+        if not refresh:
+            cached = get_habitat_cache(cache_key)
+            if cached:
+                return {**cached, "cached": True}
+        response = build_habitat_response(species, region)
+        set_habitat_cache(cache_key, response)
     return response
 
 # ==================================================
@@ -618,13 +714,19 @@ def habitat_grid(species: str = "bluefish", region: str = "turkey", refresh: boo
 # ==================================================
 
 @app.get("/save-grid")
-def save_grid(species: str = "bluefish", region: str = "turkey", secret: str = ""):
-    if secret != CRON_SECRET:
+def save_grid(species: str = "bluefish", region: str = "turkey", secret: str = "",
+              x_cron_secret: Optional[str] = Header(default=None)):
+    if not CRON_SECRET:
+        raise HTTPException(status_code=503, detail="CRON_SECRET tanımlı değil")
+    # Tercih edilen: X-Cron-Secret header. ?secret= eski cron'lar için geçici olarak destekleniyor.
+    if not is_authorized(x_cron_secret or secret):
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _db:
         raise HTTPException(status_code=500, detail="Firebase bağlı değil")
 
-    data          = build_habitat_response(species, region)
+    with _habitat_build_lock:
+        data = build_habitat_response(species, region)
+    set_habitat_cache(f"{species}:{region}", data)
     doc_id        = f"{species}_{region}"
     generation_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     ref           = _db.collection("habitat_grids").document(doc_id)
