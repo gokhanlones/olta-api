@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="3.6")
+app = FastAPI(title="OLTA Marine API", version="3.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -229,11 +229,23 @@ def is_blacksea_region(lat, lng):
     return 40.0 <= lat <= 48.0 and 26.5 <= lng <= 42.0
 
 
+CHL_SEARCH_RADIUS_KM = 10      # kıyıda en yakın geçerli uydu pikselini bu yarıçapta ara
+CHL_SEARCH_BUFFER    = 0.12    # derece; ~10 km yarıçapı kapsayan indirme kutusu
+CHL_FRESH_DAYS       = 3       # bu kadar yeni ölçüm bulununca sonraki kaynaklara geçme
+
+
 def get_chlorophyll_records(source, lat, lng, start_date, end_date):
+    """Her gün için noktaya en yakın GEÇERLİ pikseli döndürür.
+
+    Kıyıda/boğazda en yakın piksel genelde kara veya bulut maskesidir; bu yüzden
+    yalnızca en yakın piksele bakmak yerine CHL_SEARCH_RADIUS_KM içindeki en
+    yakın geçerli ölçüm alınır.
+    """
     ds = None
     try:
         ds = get_dataset(source["id"], ["CHL"], lat, lng,
-                         start_date=start_date, end_date=end_date)
+                         start_date=start_date, end_date=end_date,
+                         buffer=CHL_SEARCH_BUFFER)
         if "CHL" not in ds:
             raise Exception(f"CHL bulunamadı: {list(ds.data_vars)}")
         data = ds["CHL"]
@@ -241,16 +253,33 @@ def get_chlorophyll_records(source, lat, lng, start_date, end_date):
         lng_name = next((n for n in ["longitude","lon"] if n in data.dims), None)
         if not lat_name or not lng_name:
             raise Exception(f"Koordinatlar bulunamadı: {list(data.dims)}")
-        data = data.sel({lat_name: lat, lng_name: lng}, method="nearest")
         if "time" not in data.dims:
             raise Exception("CHL verisinde zaman boyutu bulunamadı.")
-        values = np.asarray(data.compute().values).reshape(-1)
-        times  = ds["time"].values
+        data = data.transpose("time", lat_name, lng_name, ...).squeeze(drop=True)
+        if data.ndim == 2:                       # tek zaman adımı
+            data = data.expand_dims("time")
+        values = np.asarray(data.compute().values, dtype=float)
+        times  = np.asarray(data["time"].values).reshape(-1)
+        lats   = np.asarray(data[lat_name].values, dtype=float)
+        lngs   = np.asarray(data[lng_name].values, dtype=float)
+
+        # Noktaya mesafe (km, eşdikdörtgen yaklaşımı — 10 km ölçeğinde yeterli)
+        dlat = (lats[:, None] - lat) * 111.32
+        dlng = (lngs[None, :] - lng) * 111.32 * math.cos(math.radians(lat))
+        dist = np.sqrt(dlat**2 + dlng**2)
+        in_radius = dist <= CHL_SEARCH_RADIUS_KM
+
         records = {}
-        for timestamp, raw_value in zip(times, values):
+        for t_idx, timestamp in enumerate(times):
             date  = str(timestamp)[:10]
-            value = float(raw_value)
-            records[date] = value if (math.isfinite(value) and 0 < value <= 100) else None
+            frame = values[t_idx]
+            valid = np.isfinite(frame) & (frame > 0) & (frame <= 100) & in_radius
+            if not valid.any():
+                records[date] = None
+                continue
+            masked = np.where(valid, dist, np.inf)
+            k = np.unravel_index(np.argmin(masked), masked.shape)
+            records[date] = {"value": float(frame[k]), "distance_km": round(float(dist[k]), 2)}
         return records, None
     except Exception as e:
         return {}, str(e)[:500]
@@ -263,21 +292,26 @@ def get_chlorophyll_history_data(lat, lng, days):
     now        = datetime.now(timezone.utc).replace(tzinfo=None)
     end_date   = now.strftime("%Y-%m-%dT23:59:59")
     start_date = (now - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
+    fresh_since = (now - timedelta(days=CHL_FRESH_DAYS)).strftime("%Y-%m-%d")
     merged = {}
     source_status = {}
     sources = [s for s in CHL_SOURCES
                if not (s["regional"] and not is_blacksea_region(lat, lng))]
     for source in sources:
+        # Yeterince güncel ölçüm varsa kalan kaynakları indirme (bellek/süre)
+        if any(v is not None and d >= fresh_since for d, v in merged.items()):
+            source_status[source["name"]] = {"ok": None, "skipped": True}
+            continue
         records, error = get_chlorophyll_records(source, lat, lng, start_date, end_date)
         valid_count = sum(1 for v in records.values() if v is not None)
         source_status[source["name"]] = {
             "ok": error is None, "valid_records": valid_count,
             "total_records": len(records), "error": error
         }
-        for date, value in records.items():
-            if value is not None:
+        for date, rec in records.items():
+            if rec is not None:
                 if date not in merged or merged[date] is None:
-                    merged[date] = {"value": value, "source": source["name"]}
+                    merged[date] = {**rec, "source": source["name"]}
             elif date not in merged:
                 merged[date] = None
     return merged, source_status
@@ -292,7 +326,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "3.6"
+        "version":  "3.7"
     }
 
 # ==================================================
@@ -382,6 +416,7 @@ def marine(lat: float, lng: float):
             result["chlorophyll"]        = latest_item["value"]
             result["chlorophyll_time"]   = latest_date
             result["chlorophyll_source"] = latest_item["source"]
+            result["chlorophyll_distance_km"] = latest_item.get("distance_km")
         else:
             result["errors"]["chlorophyll"] = "Geçerli klorofil ölçümü bulunamadı."
     except Exception as e:
