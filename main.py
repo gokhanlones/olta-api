@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="4.1")
+app = FastAPI(title="OLTA Marine API", version="4.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -330,7 +330,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "4.1"
+        "version":  "4.2"
     }
 
 # ==================================================
@@ -900,9 +900,12 @@ def generate_and_store_posts(cells, force=False):
     date_str = today.strftime("%Y-%m-%d")
     posts_ref = _db.collection("feed_posts")
 
-    existing = list(posts_ref.where("date", "==", date_str).limit(1).stream())
+    existing = [d for d in posts_ref.where("date", "==", date_str).stream()
+                if d.to_dict().get("type") == "spot_forecast"]
     if existing and not force:
         return {"ok": True, "skipped": "bugünün gönderileri zaten var", "date": date_str}
+    # force + bugün gönderi varsa: yeni tür seçme, aynı türleri yerinde güncelle
+    only_species = {d.to_dict().get("species") for d in existing} if existing else None
 
     fish_list = []
     for doc in _db.collection("fish").stream():
@@ -918,17 +921,25 @@ def generate_and_store_posts(cells, force=False):
             last_posted[d["species"]] = d.get("date", "")
 
     posts, coastal_count = feed.build_daily_posts(
-        cells, fish_list, last_posted, today, _fish_score, range_score, wind_fn=fetch_daily_wind)
+        cells, fish_list, last_posted, today, _fish_score, range_score,
+        wind_fn=fetch_daily_wind, only_species=only_species)
 
     batch = _db.batch()
     for i, post in enumerate(posts):
         doc = {k: v for k, v in post.items() if k != "id"}
-        doc["createdAt"] = fs.SERVER_TIMESTAMP
-        doc["order"] = i
-        batch.set(posts_ref.document(post["id"]), doc)
+        ref = posts_ref.document(post["id"])
+        if only_species is not None:
+            # Yerinde güncelle: createdAt / order korunur (akışta zıplamaz, zilde tekrar "yeni" olmaz);
+            # beğeni ve yorum alt kayıtları etkilenmez.
+            batch.set(ref, doc, merge=True)
+        else:
+            doc["createdAt"] = fs.SERVER_TIMESTAMP
+            doc["order"] = i
+            batch.set(ref, doc)
     if posts:
         batch.commit()
     return {"ok": True, "date": date_str, "posts": [p["species"] for p in posts],
+            "updated_in_place": only_species is not None,
             "coastal_cells": coastal_count}
 
 

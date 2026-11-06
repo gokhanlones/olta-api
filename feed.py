@@ -369,17 +369,21 @@ def compose_text(fish, spots, rng, range_score_fn, wind=None):
 # ---------------------------------------------------------------------------
 
 def build_daily_posts(cells, fish_list, last_posted, today, score_fn, range_score_fn,
-                      posts_per_day=POSTS_PER_DAY, wind_fn=None):
+                      posts_per_day=POSTS_PER_DAY, wind_fn=None, only_species=None):
     """Firestore'a yazılacak gönderileri döndürür (yazmaz; test edilebilir).
 
     wind_fn(lat, lng) -> {"speed_kmh", "dir_from"} | None: en iyi noktanın o günkü
     rüzgârı (alınamazsa metin rüzgârsız yazılır).
+    only_species: verilirse yeni tür seçilmez, yalnızca bu türler (aynı kimlikle)
+    yeniden üretilir — bugünün gönderilerini yerinde güncellemek için.
     """
     candidates = coastal_candidates(cells)
     date_str = today.strftime("%Y-%m-%d")
     options = []
     for fish in fish_list:
         if fish.get("type") != "deniz" or fish.get("sstMin") is None or fish.get("sstMax") is None:
+            continue
+        if only_species is not None and fish["name"] not in only_species:
             continue
         if is_banned(fish, today):
             continue
@@ -390,7 +394,8 @@ def build_daily_posts(cells, fish_list, last_posted, today, score_fn, range_scor
     # En uzun süredir paylaşılmayan türler önce; eşitse skoru yüksek olan
     options.sort(key=lambda x: (x[0], x[1], x[2]["name"]))
     posts = []
-    for _, _, fish, spots in options[:posts_per_day]:
+    limit_n = len(options) if only_species is not None else posts_per_day
+    for _, _, fish, spots in options[:limit_n]:
         rng = random.Random(f"{date_str}:{fish['name']}")
         wind = None
         if wind_fn:
