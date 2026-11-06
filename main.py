@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
+import requests
 
 import feed
 import copernicusmarine
@@ -22,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # FASTAPI
 # ==================================================
 
-app = FastAPI(title="OLTA Marine API", version="4.0")
+app = FastAPI(title="OLTA Marine API", version="4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -329,7 +330,7 @@ def health():
         "status": "ok",
         "user":     bool(CMEMS_USER),
         "firebase": _db is not None,
-        "version":  "4.0"
+        "version":  "4.1"
     }
 
 # ==================================================
@@ -875,6 +876,22 @@ def _fish_score(temperature, salinity, fish):
     return habitat_score(temperature, salinity, params)
 
 
+def fetch_daily_wind(lat, lng):
+    """Open-Meteo: bugünün en yüksek rüzgâr hızı (km/sa) ve ağırlıklı yönü (nereden)."""
+    r = requests.get("https://api.open-meteo.com/v1/forecast", params={
+        "latitude": lat, "longitude": lng,
+        "daily": "wind_speed_10m_max,wind_direction_10m_dominant",
+        "wind_speed_unit": "kmh", "timezone": "Europe/Istanbul", "forecast_days": 1,
+    }, timeout=8)
+    r.raise_for_status()
+    d = r.json().get("daily", {})
+    speed = (d.get("wind_speed_10m_max") or [None])[0]
+    dirn  = (d.get("wind_direction_10m_dominant") or [None])[0]
+    if speed is None:
+        return None
+    return {"speed_kmh": round(float(speed), 1), "dir_from": round(float(dirn)) if dirn is not None else None}
+
+
 def generate_and_store_posts(cells, force=False):
     """Bugünün gönderilerini üret ve feed_posts koleksiyonuna yaz (günde bir kez)."""
     if _db is None:
@@ -901,7 +918,7 @@ def generate_and_store_posts(cells, force=False):
             last_posted[d["species"]] = d.get("date", "")
 
     posts, coastal_count = feed.build_daily_posts(
-        cells, fish_list, last_posted, today, _fish_score, range_score)
+        cells, fish_list, last_posted, today, _fish_score, range_score, wind_fn=fetch_daily_wind)
 
     batch = _db.batch()
     for i, post in enumerate(posts):
