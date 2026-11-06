@@ -22,6 +22,25 @@ MAX_PLACE_KM       = 12.0   # kıyı noktası bilinen bir Türkiye kıyı yerine
 MIN_SPOT_SEPARATION_KM = 25.0
 SEAWARD_OFFSET_KM  = 0.3    # pin kıyı çizgisinin hemen denize tarafına konur
 STRONG_CURRENT_MS  = 0.5
+STRONG_WIND_KMH    = 30     # bu ve üstü rüzgârda uyarı
+
+# 8 yön: akıntı "nereye" akar, rüzgâr "nereden" eser (denizcilik geleneği)
+DIR_TO   = ["kuzeye", "kuzeydoğuya", "doğuya", "güneydoğuya", "güneye", "güneybatıya", "batıya", "kuzeybatıya"]
+DIR_FROM = ["kuzeyden", "kuzeydoğudan", "doğudan", "güneydoğudan", "güneyden", "güneybatıdan", "batıdan", "kuzeybatıdan"]
+WIND_NAMES = ["yıldız", "poyraz", "gündoğusu", "keşişleme", "kıble", "lodos", "günbatısı", "karayel"]
+
+
+def sector(deg):
+    return int(((deg % 360) + 22.5) // 45) % 8
+
+
+def tr_thousands(n):
+    return f"{int(n):,}".replace(",", ".")
+
+
+def salinity_ppm(psu):
+    """Pratik tuzluluk (PSU ≈ g/kg) → ppm, 100'lük basamağa yuvarlı."""
+    return int(round(psu * 1000 / 100.0)) * 100
 
 KM_PER_DEG = 111.32
 
@@ -256,6 +275,8 @@ def pick_spots(candidates, fish, score_fn):
             "temperature": c.get("temperature"),
             "salinity": c.get("salinity"),
             "current_speed": round(math.hypot(u, v), 3) if u is not None and v is not None else None,
+            # Akıntının aktığı yön (kuzeyden saat yönünde derece)
+            "current_dir": round((math.degrees(math.atan2(u, v)) + 360) % 360) if u is not None and v is not None else None,
         })
         if len(chosen) >= SPOTS_PER_POST:
             break
@@ -265,12 +286,13 @@ def pick_spots(candidates, fish, score_fn):
 # Metin (3 cümle, veriye göre değişen şablonlar)
 # ---------------------------------------------------------------------------
 
-def compose_text(fish, spots, rng, range_score_fn):
+def compose_text(fish, spots, rng, range_score_fn, wind=None):
     name  = fish["name"]
     low   = tr_lower(name)
     places = tr_join([s["place"] for s in spots])
     best  = spots[0]
 
+    # 1) Tür + kıyılar
     if len(spots) > 1:
         s1 = rng.choice([
             f"Bugün {low} için koşulların en uygun göründüğü kıyılar: {places}.",
@@ -284,6 +306,7 @@ def compose_text(fish, spots, rng, range_score_fn):
             f"{name} arayanlar için bugünün adresi {places} kıyıları görünüyor.",
         ])
 
+    # 2) Su: sıcaklık + tuzluluk (ppm)
     t = best.get("temperature")
     s = best.get("salinity")
     s2 = ""
@@ -297,32 +320,61 @@ def compose_text(fish, spots, rng, range_score_fn):
         else:
             pos = rng.choice([f"{low} için ideal aralıkta", f"{low} için tam uygun aralıkta"])
         sal = ""
-        if s is not None and fish.get("sssMin") is not None and fish.get("sssMax") is not None:
-            ok = (range_score_fn(s, fish["sssMin"], fish["sssMax"]) or 0) > 0
-            sal = f", tuzluluk {tr_num(s)} ile {'uygun' if ok else 'aralığın dışında'}"
+        if s is not None:
+            sal = f", tuzluluk yaklaşık {tr_thousands(salinity_ppm(s))} ppm"
+            if fish.get("sssMin") is not None and fish.get("sssMax") is not None:
+                ok = (range_score_fn(s, fish["sssMin"], fish["sssMax"]) or 0) > 0
+                sal += " ile uygun" if ok else " ile aralığın dışında"
         s2 = rng.choice([
             f"{best['place']} çevresinde su {tr_num(t)} °C ile {pos}{sal}.",
             f"{best['place']} açığında yüzey suyu {tr_num(t)} °C; bu {pos}{sal}.",
         ])
 
-    cur = best.get("current_speed")
-    if cur is not None and cur >= STRONG_CURRENT_MS:
-        s3 = f"Akıntı {tr_num(cur)} m/s ile güçlü, takımını buna göre hazırla."
+    # 3) Akıntı (hız + yön) ve rüzgâr (gün içi en yüksek hız + ağırlıklı yön)
+    parts = []
+    cur, cdir = best.get("current_speed"), best.get("current_dir")
+    if cur is not None:
+        parts.append(f"akıntı {tr_num(cur)} m/s hızla {DIR_TO[sector(cdir)]} akıyor" if cdir is not None
+                     else f"akıntı {tr_num(cur)} m/s")
+    if wind and wind.get("speed_kmh") is not None:
+        w = f"rüzgâr gün içinde en fazla {round(wind['speed_kmh'])} km/sa"
+        if wind.get("dir_from") is not None:
+            k = sector(wind["dir_from"])
+            w = f"rüzgâr gün içinde {DIR_FROM[k]} ({WIND_NAMES[k]}) en fazla {round(wind['speed_kmh'])} km/sa esecek"
+        parts.append(w)
+    s3 = ""
+    if parts:
+        s3 = "; ".join(parts) + "."
+        s3 = s3[0].upper() + s3[1:]
+
+    # 4) Kapanış / uyarı
+    strong_cur  = cur is not None and cur >= STRONG_CURRENT_MS
+    strong_wind = bool(wind) and (wind.get("speed_kmh") or 0) >= STRONG_WIND_KMH
+    if strong_cur and strong_wind:
+        s4 = "Akıntı ve rüzgâr sert, takımını ve güvenliğini buna göre hazırla."
+    elif strong_cur:
+        s4 = "Akıntı güçlü, takımını buna göre hazırla."
+    elif strong_wind:
+        s4 = "Rüzgâr sert, kıyıda dikkatli ol."
     else:
-        s3 = rng.choice([
-            "Akıntı sakin; koşullar denemeye değer görünüyor.",
+        s4 = rng.choice([
+            "Koşullar denemeye değer görünüyor.",
             "Deniz verileri umut verici, rastgele!",
             "Bu değerlendirme deniz verilerine dayanır, av garantisi değildir.",
         ])
-    return " ".join(x for x in (s1, s2, s3) if x)
+    return " ".join(x for x in (s1, s2, s3, s4) if x)
 
 # ---------------------------------------------------------------------------
 # Günlük gönderi üretimi
 # ---------------------------------------------------------------------------
 
 def build_daily_posts(cells, fish_list, last_posted, today, score_fn, range_score_fn,
-                      posts_per_day=POSTS_PER_DAY):
-    """Firestore'a yazılacak gönderileri döndürür (yazmaz; test edilebilir)."""
+                      posts_per_day=POSTS_PER_DAY, wind_fn=None):
+    """Firestore'a yazılacak gönderileri döndürür (yazmaz; test edilebilir).
+
+    wind_fn(lat, lng) -> {"speed_kmh", "dir_from"} | None: en iyi noktanın o günkü
+    rüzgârı (alınamazsa metin rüzgârsız yazılır).
+    """
     candidates = coastal_candidates(cells)
     date_str = today.strftime("%Y-%m-%d")
     options = []
@@ -340,12 +392,19 @@ def build_daily_posts(cells, fish_list, last_posted, today, score_fn, range_scor
     posts = []
     for _, _, fish, spots in options[:posts_per_day]:
         rng = random.Random(f"{date_str}:{fish['name']}")
+        wind = None
+        if wind_fn:
+            try:
+                wind = wind_fn(spots[0]["lat"], spots[0]["lng"])
+            except Exception:
+                wind = None
         posts.append({
             "id": f"{date_str.replace('-', '')}_{slugify(fish['name'])}",
             "type": "spot_forecast",
             "species": fish["name"],
             "date": date_str,
-            "text": compose_text(fish, spots, rng, range_score_fn),
+            "text": compose_text(fish, spots, rng, range_score_fn, wind),
+            "wind": wind,
             "spots": spots,
             "author": {"name": "OLTA", "system": True},
         })
